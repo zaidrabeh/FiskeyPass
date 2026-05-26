@@ -1,4 +1,4 @@
-# 🔐 FiskeyPass v4
+# 🔐 FiskeyPass v4.0.0
 
 <p align="center">
   <img src="https://img.shields.io/badge/Hardware-ESP32-blue?style=for-the-badge&logo=espressif" />
