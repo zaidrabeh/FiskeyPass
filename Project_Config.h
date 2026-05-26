@@ -1,5 +1,5 @@
 // =============================================================================
-// Project_Config.h — FiskeyPass v3.0.1 Central Hardware & Application Configuration
+// Project_Config.h — FiskeyPass v4.0.0 Central Hardware & Application Configuration
 // =============================================================================
 //
 // PURPOSE:
@@ -73,10 +73,10 @@
 // SECTION 5 — PROJECT VERSION
 // =============================================================================
 
-#define FISKEYPASS_VERSION_MAJOR 3
+#define FISKEYPASS_VERSION_MAJOR 4
 #define FISKEYPASS_VERSION_MINOR 0
-#define FISKEYPASS_VERSION_PATCH 1
-#define FISKEYPASS_VERSION_STR   "v3.0.1"
+#define FISKEYPASS_VERSION_PATCH 0
+#define FISKEYPASS_VERSION_STR   "v4.0.0"
 
 // =============================================================================
 // SECTION 6 — NAVIGATION BUTTON PINS
@@ -101,7 +101,7 @@ static constexpr unsigned long DISPLAY_TIMEOUT_MS = 30000;   // Screen blanks 30
 // SECTION 8 — PASSWORD VAULT LIMITS
 // =============================================================================
 
-static constexpr int MAX_CREDENTIAL_ITEMS  = 24;
+static constexpr int MAX_CREDENTIAL_ITEMS  = 500;
 static constexpr int CREDENTIAL_NAME_LEN   = 32;
 static constexpr int CREDENTIAL_USER_LEN   = 64;
 static constexpr int CREDENTIAL_PASS_LEN   = 64;
@@ -110,7 +110,7 @@ static constexpr int CREDENTIAL_PASS_LEN   = 64;
 // SECTION 9 — SECURITY CONSTANTS
 // =============================================================================
 
-static constexpr int  PIN_LENGTH         = 4;      // 4-digit numeric PIN
+static constexpr int  PIN_LENGTH         = 6;      // 6-digit numeric PIN
 static constexpr int  PBKDF2_ITERATIONS  = 10000;  // Key derivation rounds
 static constexpr int  MAX_PIN_ATTEMPTS   = 5;      // Before lockout
 static constexpr unsigned long LOCKOUT_DURATION_MS = 60000;  // 60 second lockout
@@ -122,7 +122,7 @@ static constexpr int  GCM_TAG_SIZE       = 16;     // 128-bit auth tag
 // SECTION 10 — LittleFS FILE PATHS
 // =============================================================================
 
-#define VAULT_FILE_PATH   "/vault.enc"
+#define VAULT_FILE_PATH   "/vault.dat"
 #define CONFIG_FILE_PATH  "/config.json"
 
 // =============================================================================

@@ -1,5 +1,5 @@
 // =============================================================================
-// FiskeyPass.ino — v3.0.1 Main Firmware
+// FiskeyPass.ino — v4.0.0 Main Firmware
 // =============================================================================
 //
 // ARCHITECTURE (state machine):
@@ -343,7 +343,7 @@ void drawPinScreen(bool isCreating, uint8_t activeDigit, const char* title,
 
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("\n[BOOT] FiskeyPass v3.0.1 starting"));
+  Serial.println(F("\n[BOOT] FiskeyPass v4.0.0 starting"));
 
   // ── GPIO init ──────────────────────────────────────────────────────────────
   pinMode(PIN_BTN_UP,     INPUT_PULLUP);
@@ -356,10 +356,9 @@ void setup() {
   tft.setRotation(1);              // Landscape: 160 wide × 128 tall
   tft.fillScreen(COL_BG);
 
-  // ── LittleFS init ─────────────────────────────────────────────────────────
-  if (!vaultFsInit()) {
-    drawCentredMsg("FS MOUNT FAILED", "Check flash config", COL_RED, COL_DIM);
-    // Halt — cannot continue without filesystem
+  // ── LittleFS init (robust: format raw partition if needed) ─────────────────
+  if (!initLittleFS()) {
+    drawCentredMsg("LittleFS FAILED", "Erase flash & retry", COL_RED, COL_DIM);
     while (true) delay(1000);
   }
 
@@ -372,7 +371,7 @@ void setup() {
     memset(rtcSessionPin, 0, sizeof(rtcSessionPin));
     memset(sessionPin, 0, sizeof(sessionPin));
 
-    Serial.println(F("[BOOT] Portal flag found — Entering Web Portal Mode (v3.0.1)"));
+    Serial.println(F("[BOOT] Portal flag found — Entering Web Portal Mode (v4.0.0)"));
     appState = STATE_WEB_PORTAL;
     enterWebPortalMode();
     return;
@@ -515,7 +514,7 @@ void enterPinEntry(bool isFirstBoot) {
   }
 }
 
-// ── Draw the 4-digit PIN UI ──────────────────────────────────────────────────
+// ── Draw the 6-digit PIN UI ──────────────────────────────────────────────────
 //   isCreating : true = "Set PIN" UI, false = "Enter PIN" UI
 //   activeDigit: which box is being edited (0-3)
 //   title      : screen header string
@@ -535,10 +534,10 @@ void drawPinScreen(bool isCreating, uint8_t activeDigit, const char* title,
   tft.setCursor(max(ix, 2), 32);
   tft.print(instr);
 
-  // ── 4 digit boxes ─────────────────────────────────────────────────────────
-  // Each box: 20 px wide, 24 px tall, spaced 10 px apart
+  // ── 6 digit boxes ─────────────────────────────────────────────────────────
+  // Each box: 18 px wide, 24 px tall, spaced 6 px apart
   // Centre the group horizontally
-  const int boxW = 20, boxH = 24, gap = 10;
+  const int boxW = 18, boxH = 24, gap = 6;
   int totalW = PIN_LENGTH * boxW + (PIN_LENGTH - 1) * gap;
   int startX = (tft.width() - totalW) / 2;
   int boxY   = 48;
@@ -645,10 +644,7 @@ void loopPinEntry(bool isFirstBoot) {
               // Vault starts empty on first boot — no load needed
               vaultCount = 0;
               
-              addCredential("Test BLE", "testuser", "testpass123");
-              String json = serializeVault();
-              fs::File f = LittleFS.open(VAULT_FILE_PATH, "w");
-              if (f) { f.print(json); f.close(); }
+              addCredential("Test BLE", "testuser", "testpass123", sessionPin);
 
               // Init BLE now that we are past portal mode
               bleKeyboard.bleInit();
@@ -714,10 +710,7 @@ void loopPinEntry(bool isFirstBoot) {
         }
 
         if (vaultCount == 0) {
-          addCredential("Test BLE", "testuser", "testpass123");
-          String json = serializeVault();
-          fs::File f = LittleFS.open(VAULT_FILE_PATH, "w");
-          if (f) { f.print(json); f.close(); }
+          addCredential("Test BLE", "testuser", "testpass123", sessionPin);
         }
 
         bleKeyboard.bleInit();
@@ -978,7 +971,7 @@ static const char* passListPtrs[MAX_CREDENTIAL_ITEMS];
 
 void buildPassListPtrs() {
   for (int i = 0; i < vaultCount && i < MAX_CREDENTIAL_ITEMS; i++) {
-    passListPtrs[i] = vault[i].name;
+    passListPtrs[i] = vaultIndex[i].name;
   }
 }
 
@@ -1042,19 +1035,23 @@ static const char* DETAIL_ACTIONS[] = {
 };
 static const int DETAIL_ACTION_COUNT = 2;
 
-// Draw the credential detail screen
 // Shows name/user, then the two-action menu below
 void drawPassDetail(int idx) {
   tft.fillScreen(COL_BG);
   drawStatusBar();
 
+  // Decrypt this one entry on demand — only name and user needed for display here;
+  // full struct also contains pass for reveal mode.
+  Credential cred;
+  bool credOk = decryptEntry(idx, sessionPin, &cred);
+
   // Credential header card (top area)
   tft.setTextColor(COL_TITLE, COL_BG);
   tft.setTextSize(1);
   tft.setCursor(4, USABLE_Y + 2);
-  // Truncate name to fit
+  // Use lightweight index name as title (always available without decrypt)
   char nameBuf[28];
-  strlcpy(nameBuf, vault[idx].name, sizeof(nameBuf));
+  strlcpy(nameBuf, vaultIndex[idx].name, sizeof(nameBuf));
   tft.print(nameBuf);
 
   tft.drawFastHLine(0, USABLE_Y + 12, tft.width(), COL_DIVIDER);
@@ -1064,22 +1061,31 @@ void drawPassDetail(int idx) {
   tft.setCursor(4, USABLE_Y + 16);
   tft.print("User: ");
   tft.setTextColor(COL_TEXT, COL_BG);
-  char userBuf[28];
-  strlcpy(userBuf, vault[idx].user, sizeof(userBuf));
-  tft.print(userBuf);
+  if (credOk) {
+    char userBuf[28];
+    strlcpy(userBuf, cred.user, sizeof(userBuf));
+    tft.print(userBuf);
+  } else {
+    tft.setTextColor(COL_RED, COL_BG);
+    tft.print("[err]");
+  }
 
   // Password row — masked unless revealed
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setCursor(4, USABLE_Y + 26);
   tft.print("Pass: ");
-  tft.setTextColor(passRevealed ? COL_GREEN : COL_TEXT, COL_BG);
-  if (passRevealed) {
+  if (passRevealed && credOk) {
+    tft.setTextColor(COL_GREEN, COL_BG);
     char passBuf[28];
-    strlcpy(passBuf, vault[idx].pass, sizeof(passBuf));
+    strlcpy(passBuf, cred.pass, sizeof(passBuf));
     tft.print(passBuf);
   } else {
+    tft.setTextColor(COL_TEXT, COL_BG);
     tft.print("* * * *");
   }
+
+  // Wipe the decrypted credential from RAM immediately after display use
+  memset(&cred, 0, sizeof(Credential));
 
   tft.drawFastHLine(0, USABLE_Y + 36, tft.width(), COL_DIVIDER);
 
@@ -1145,7 +1151,11 @@ void loopPassDetail(int idx) {
           tft.setCursor(4, 116);
           tft.print("Typing password...");
 
-          bleKeyboard.bleTypeString(vault[idx].pass);
+          Credential cred;
+          if (decryptEntry(idx, sessionPin, &cred)) {
+            bleKeyboard.bleTypeString(cred.pass);
+            memset(&cred, 0, sizeof(Credential));
+          }
 
           // Confirm sent
           tft.fillRect(0, 112, tft.width(), 16, COL_BG);
@@ -1399,7 +1409,7 @@ void setupWebPortalRoutes() {
 
       const char* pin = body["pin"] | "";
       if (strlen(pin) != PIN_LENGTH) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"PIN must be 4 digits\"}");
+        req->send(400, "application/json", "{\"ok\":false,\"error\":\"PIN must be 6 digits\"}");
         return;
       }
 
@@ -1428,19 +1438,56 @@ void setupWebPortalRoutes() {
     }
   );
 
-  // ── GET /api/vault — entry list (names + usernames ONLY, no passwords) ──────
+  // ── GET /api/vault — returns names and usernames only ───────────────────────
   webServer.on("/api/vault", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!requireUnlock(req)) return;
-    DynamicJsonDocument doc(4096);
-    JsonArray arr = doc.createNestedArray("entries");
-    for (int i = 0; i < vaultCount; i++) {
-      JsonObject o = arr.createNestedObject();
-      o["n"] = vault[i].name;
-      o["u"] = vault[i].user;
-    }
-    String body;
-    serializeJson(doc, body);
-    req->send(200, "application/json", body);
+
+    AsyncWebServerResponse *response = req->beginChunkedResponse("application/json", [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      static int currentIdx = 0;
+      static int phase = 0; // 0=header, 1=entries, 2=footer
+
+      if (index == 0) {
+        currentIdx = 0;
+        phase = 0;
+      }
+
+      if (phase == 0) {
+        phase = 1;
+        return snprintf((char*)buffer, maxLen, "{\"entries\":[");
+      }
+      
+      if (phase == 1) {
+        if (currentIdx < vaultCount) {
+          Credential cred;
+          if (decryptEntry(currentIdx, sessionPin, &cred)) {
+            DynamicJsonDocument doc(256);
+            doc["n"] = cred.name;
+            doc["u"] = cred.user;
+            doc["p"] = ""; // Never send password
+            String json;
+            serializeJson(doc, json);
+            memset(&cred, 0, sizeof(Credential)); // Wipe RAM
+            
+            size_t len = snprintf((char*)buffer, maxLen, "%s%s", (currentIdx > 0) ? "," : "", json.c_str());
+            currentIdx++;
+            return len;
+          } else {
+            currentIdx++;
+            return snprintf((char*)buffer, maxLen, " ");
+          }
+        } else {
+          phase = 2;
+        }
+      }
+
+      if (phase == 2) {
+        phase = 3;
+        return snprintf((char*)buffer, maxLen, "]}");
+      }
+
+      return 0; // done
+    });
+    req->send(response);
   });
 
   // ── POST /api/entry — add or edit entry ────────────────────────────────────
@@ -1472,17 +1519,16 @@ void setupWebPortalRoutes() {
       bool ok = false;
       if (body.containsKey("id")) {
         int id = body["id"].as<int>();
-        ok = updateCredential(id, n, u, (strlen(p) > 0 ? p : nullptr));
+        ok = updateCredential(id, n, u, (strlen(p) > 0 ? p : nullptr), sessionPin);
       } else {
         if (strlen(p) == 0) {
           req->send(400, "application/json", "{\"ok\":false,\"error\":\"Password required\"}");
           return;
         }
-        ok = addCredential(n, u, p);
+        ok = addCredential(n, u, p, sessionPin);
       }
 
       if (ok) {
-        saveVault(sessionPin);
         req->send(200, "application/json", "{\"ok\":true}");
       } else {
         req->send(400, "application/json", "{\"ok\":false,\"error\":\"Vault full or bad index\"}");
@@ -1498,8 +1544,7 @@ void setupWebPortalRoutes() {
       return;
     }
     int id = req->getParam("id")->value().toInt();
-    if (deleteCredential(id)) {
-      saveVault(sessionPin);
+    if (deleteCredential(id, sessionPin)) {
       req->send(200, "application/json", "{\"ok\":true}");
     } else {
       req->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid index\"}");
@@ -1564,17 +1609,13 @@ void setupWebPortalRoutes() {
         String fn = filename;
         fn.toLowerCase();
         if (fn.endsWith(".xml")) {
-          importKeePassXML((const char*)importBuf, importLen);
+          importKeePassXML((const char*)importBuf, importLen, sessionPin);
         } else {
-          importCSV((const char*)importBuf, importLen);
+          importCSV((const char*)importBuf, importLen, sessionPin);
         }
 
         int imported = vaultCount - countBefore;
         Serial.printf("[IMP]  Parsed %d new entries (total %d)\n", imported, vaultCount);
-
-        if (imported > 0) {
-          saveVault(sessionPin);
-        }
 
         // Store count for the request completion handler
         req->_tempObject = malloc(sizeof(int));
@@ -1618,7 +1659,7 @@ void setupWebPortalRoutes() {
       const char* newPin = body["new"] | "";
 
       if (strlen(oldPin) != PIN_LENGTH || strlen(newPin) != PIN_LENGTH) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"PIN must be 4 digits\"}");
+        req->send(400, "application/json", "{\"ok\":false,\"error\":\"PIN must be 6 digits\"}");
         return;
       }
 
@@ -1745,5 +1786,5 @@ void loopWebPortal() {
 }
 
 // =============================================================================
-// END OF FiskeyPass.ino  —  v3.0.1 complete
+// END OF FiskeyPass.ino  —  v4.0.0 complete
 // =============================================================================

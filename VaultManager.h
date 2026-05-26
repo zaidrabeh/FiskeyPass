@@ -1,14 +1,17 @@
 // =============================================================================
-// VaultManager.h — FiskeyPass v2.5.1 Encrypted Vault & Config Management
+// VaultManager.h — FiskeyPass v4.0.0 Encrypted Vault & Config Management
 // =============================================================================
 //
 // Responsibilities:
-//   - LittleFS vault load/save with AES-256-GCM encryption via Crypto.h
+//   - LittleFS streamed/indexed vault with AES-256-GCM block encryption
 //   - Config file read/write (/config.json — unencrypted, stores PIN hash)
-//   - CSV import parser (Name, Username, Password columns)
-//   - KeePass XML import via tinyxml2 (already in project folder)
-//   - ArduinoJson for vault JSON serialization
-//   - First boot detection and PIN creation flow
+//   - CSV & KeePass XML imports streamed directly to vault blocks
+//
+// Storage architecture:
+//   /vault.dat  — fixed 188-byte encrypted blocks on LittleFS
+//                 [12B IV][160B ciphertext][16B GCM tag]  per entry
+//   RAM index   — CredentialIndex[] holds only name + file offset (36B each)
+//   Passwords   — NEVER held in RAM; decrypted on demand into a temp buffer
 // =============================================================================
 
 #ifndef VAULT_MANAGER_H
@@ -17,51 +20,88 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>    // esp_task_wdt_reset() — prevents WDT on heavy I/O loops
 #include "Project_Config.h"
 #include "Crypto.h"
 #include "tinyxml2.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Credential Structure
+// Credential Structure (160 bytes — packed into one encrypted block)
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Credential {
-  char name[CREDENTIAL_NAME_LEN];
-  char user[CREDENTIAL_USER_LEN];
-  char pass[CREDENTIAL_PASS_LEN];
+  char name[CREDENTIAL_NAME_LEN];   // 32
+  char user[CREDENTIAL_USER_LEN];   // 64
+  char pass[CREDENTIAL_PASS_LEN];   // 64
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lightweight RAM Index — only names + seek offsets (36 bytes per entry)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct CredentialIndex {
+  char name[CREDENTIAL_NAME_LEN];   // 32
+  uint32_t fileOffset;              //  4
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global Vault State
 // ─────────────────────────────────────────────────────────────────────────────
 
-static Credential vault[MAX_CREDENTIAL_ITEMS];
+static CredentialIndex vaultIndex[MAX_CREDENTIAL_ITEMS];
 static int vaultCount = 0;
 
+extern char sessionPin[PIN_LENGTH + 1]; // defined in FiskeyPass.ino
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Config Structure (stored as /config.json, unencrypted)
+// Config Structure (stored as /config.json on LittleFS, unencrypted)
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct DeviceConfig {
-  char pinHash[65];           // SHA-256 hex digest of the PIN
-  bool displayTimeoutEnabled; // Screen timeout on/off
-  bool firstBoot;             // True if no config exists yet
-  char portalUser[32];        // Web portal username
-  char portalPassHash[65];    // SHA-256 hex digest of web portal password
+  char pinHash[65];
+  bool displayTimeoutEnabled;
+  bool firstBoot;
+  char portalUser[32];
+  char portalPassHash[65];
 };
 
 static DeviceConfig deviceConfig;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Filesystem Initialization
+// Block size constant: IV(12) + Credential(160) + Tag(16) = 188 bytes
 // ─────────────────────────────────────────────────────────────────────────────
 
-static bool vaultFsInit() {
-  if (!LittleFS.begin(true)) {  // true = format on first use
-    Serial.println(F("[FS]   LittleFS mount FAILED"));
+static const size_t BLOCK_SIZE = GCM_IV_SIZE + sizeof(Credential) + GCM_TAG_SIZE;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Robust LittleFS Initialization (handles raw/unformatted partitions)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool initLittleFS() {
+  // Step 1: try a normal mount (no auto-format)
+  if (LittleFS.begin(false)) {
+    Serial.println(F("[FS]   LittleFS mounted OK"));
+    return true;
+  }
+
+  // Step 2: mount failed — partition is likely raw (e.g. after switching
+  // to "Huge APP" partition scheme).  Explicitly format it.
+  Serial.println(F("[FS]   LittleFS mount failed — partition may be raw"));
+  Serial.println(F("[FS]   Formatting LittleFS..."));
+
+  if (!LittleFS.format()) {
+    Serial.println(F("[FS]   LittleFS format FAILED"));
     return false;
   }
-  Serial.println(F("[FS]   LittleFS mounted"));
+  Serial.println(F("[FS]   LittleFS format OK"));
+
+  // Step 3: mount the freshly formatted partition
+  if (!LittleFS.begin(false)) {
+    Serial.println(F("[FS]   LittleFS mount after format FAILED"));
+    return false;
+  }
+
+  Serial.println(F("[FS]   LittleFS mounted (fresh format)"));
   return true;
 }
 
@@ -97,17 +137,12 @@ static bool loadConfig() {
     return false;
   }
 
-  const char* ph = doc["pinHash"] | "";
-  strlcpy(deviceConfig.pinHash, ph, sizeof(deviceConfig.pinHash));
+  strlcpy(deviceConfig.pinHash, doc["pinHash"] | "", sizeof(deviceConfig.pinHash));
   deviceConfig.displayTimeoutEnabled = doc["displayTimeout"] | true;
   deviceConfig.firstBoot = false;
+  strlcpy(deviceConfig.portalUser, doc["portalUser"] | "", sizeof(deviceConfig.portalUser));
+  strlcpy(deviceConfig.portalPassHash, doc["portalPassHash"] | "", sizeof(deviceConfig.portalPassHash));
 
-  const char* pu = doc["portalUser"] | "";
-  strlcpy(deviceConfig.portalUser, pu, sizeof(deviceConfig.portalUser));
-  const char* pph = doc["portalPassHash"] | "";
-  strlcpy(deviceConfig.portalPassHash, pph, sizeof(deviceConfig.portalPassHash));
-
-  // If password hash is blank but user exists, clear user so setup triggers again
   if (strlen(deviceConfig.portalUser) > 0 && strlen(deviceConfig.portalPassHash) == 0) {
     memset(deviceConfig.portalUser, 0, sizeof(deviceConfig.portalUser));
   }
@@ -128,7 +163,6 @@ static bool saveConfig() {
     Serial.println(F("[CFG]  Failed to write config.json"));
     return false;
   }
-
   serializeJson(doc, f);
   f.close();
   Serial.println(F("[CFG]  Config saved"));
@@ -154,109 +188,85 @@ static bool setNewPin(const char* pin) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Vault JSON Serialization (plaintext before encryption)
-// Format: {"entries":[{"n":"Gmail","u":"user@gmail.com","p":"secret"}]}
+// On-Demand Decryption — read ONE block from /vault.dat, decrypt, return
 // ─────────────────────────────────────────────────────────────────────────────
 
-static String serializeVault() {
-  DynamicJsonDocument doc(4096);
-  JsonArray arr = doc.createNestedArray("entries");
+static bool decryptEntry(int index, const char* pin, Credential* outCred) {
+  if (index < 0 || index >= vaultCount) return false;
 
-  for (int i = 0; i < vaultCount; i++) {
-    JsonObject entry = arr.createNestedObject();
-    entry["n"] = vault[i].name;
-    entry["u"] = vault[i].user;
-    entry["p"] = vault[i].pass;
-  }
+  fs::File f = LittleFS.open(VAULT_FILE_PATH, "r");
+  if (!f) return false;
 
-  String json;
-  serializeJson(doc, json);
-  return json;
-}
-
-static bool deserializeVault(const char* json) {
-  DynamicJsonDocument doc(4096);
-  DeserializationError err = deserializeJson(doc, json);
-  if (err) {
-    Serial.print(F("[VLT]  JSON parse error: "));
-    Serial.println(err.c_str());
+  f.seek(vaultIndex[index].fileOffset);
+  uint8_t buf[BLOCK_SIZE];
+  if (f.read(buf, BLOCK_SIZE) != BLOCK_SIZE) {
+    f.close();
     return false;
   }
+  f.close();
 
-  JsonArray arr = doc["entries"];
-  vaultCount = 0;
-
-  for (JsonObject entry : arr) {
-    if (vaultCount >= MAX_CREDENTIAL_ITEMS) break;
-
-    strlcpy(vault[vaultCount].name, entry["n"] | "", CREDENTIAL_NAME_LEN);
-    strlcpy(vault[vaultCount].user, entry["u"] | "", CREDENTIAL_USER_LEN);
-    strlcpy(vault[vaultCount].pass, entry["p"] | "", CREDENTIAL_PASS_LEN);
-    vaultCount++;
-  }
-
-  Serial.printf("[VLT]  Deserialized %d entries\n", vaultCount);
-  return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Encrypted Vault File Operations
-// ─────────────────────────────────────────────────────────────────────────────
-
-static bool saveVault(const char* pin) {
-  if (!pin || strlen(pin) == 0) {
-    Serial.println(F("[VLT]  ABORT: Empty PIN provided for save"));
-    return false;
-  }
-  // Derive encryption key from PIN
   uint8_t key[AES_KEY_SIZE];
-  if (!deriveKey(pin, key, AES_KEY_SIZE)) {
-    Serial.println(F("[VLT]  Key derivation failed"));
-    return false;
-  }
+  if (!deriveKey(pin, key, AES_KEY_SIZE)) return false;
 
-  // Serialize vault to JSON
-  String json = serializeVault();
-
-  // Encrypt
-  size_t encLen = 0;
-  uint8_t* encrypted = encryptData(key, (const uint8_t*)json.c_str(),
-                                    json.length(), &encLen);
-
-  // Clear key from memory
+  size_t ptLen = 0;
+  uint8_t* plaintext = decryptData(key, buf, BLOCK_SIZE, &ptLen);
   memset(key, 0, sizeof(key));
 
-  if (!encrypted) {
-    Serial.println(F("[VLT]  Encryption failed"));
-    return false;
+  if (plaintext && ptLen == sizeof(Credential)) {
+    memcpy(outCred, plaintext, sizeof(Credential));
+    free(plaintext);
+    return true;
   }
+  if (plaintext) free(plaintext);
+  return false;
+}
 
-  // Write to LittleFS
-  fs::File f = LittleFS.open(VAULT_FILE_PATH, "w");
+// ─────────────────────────────────────────────────────────────────────────────
+// Append a single encrypted block to /vault.dat
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool appendCredentialBlock(const Credential* cred, const char* pin) {
+  if (vaultCount >= MAX_CREDENTIAL_ITEMS) return false;
+
+  uint8_t key[AES_KEY_SIZE];
+  if (!deriveKey(pin, key, AES_KEY_SIZE)) return false;
+
+  size_t encLen = 0;
+  uint8_t* encrypted = encryptData(key, (const uint8_t*)cred, sizeof(Credential), &encLen);
+  memset(key, 0, sizeof(key));
+
+  if (!encrypted) return false;
+
+  fs::File f = LittleFS.open(VAULT_FILE_PATH, "a");   // append mode
   if (!f) {
     free(encrypted);
-    Serial.println(F("[VLT]  Failed to open vault file for writing"));
     return false;
   }
 
+  uint32_t offset = f.size();
   size_t written = f.write(encrypted, encLen);
   f.close();
   free(encrypted);
 
-  if (written != encLen) {
-    Serial.println(F("[VLT]  Write incomplete"));
-    return false;
+  if (written == encLen) {
+    strlcpy(vaultIndex[vaultCount].name, cred->name, CREDENTIAL_NAME_LEN);
+    vaultIndex[vaultCount].fileOffset = offset;
+    vaultCount++;
+    return true;
   }
-
-  Serial.printf("[VLT]  Vault saved (%d bytes encrypted)\n", encLen);
-  return true;
+  return false;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Load vault — stream through /vault.dat, extract names into RAM index
+// ─────────────────────────────────────────────────────────────────────────────
+
 static bool loadVault(const char* pin) {
+  vaultCount = 0;
+
   if (!LittleFS.exists(VAULT_FILE_PATH)) {
     Serial.println(F("[VLT]  No vault file — starting empty"));
-    vaultCount = 0;
-    return true;  // Not an error, just empty
+    return true;  // not an error, just empty
   }
 
   fs::File f = LittleFS.open(VAULT_FILE_PATH, "r");
@@ -265,54 +275,201 @@ static bool loadVault(const char* pin) {
     return false;
   }
 
-  size_t fileSize = f.size();
-  uint8_t* encrypted = (uint8_t*)malloc(fileSize + 1);  // +1 for portal raw-JSON null terminator
-  if (!encrypted) {
-    f.close();
-    Serial.println(F("[VLT]  Malloc failed for vault read"));
-    return false;
-  }
-
-  f.read(encrypted, fileSize);
-  f.close();
-
-
-  // Derive key
   uint8_t key[AES_KEY_SIZE];
   if (!deriveKey(pin, key, AES_KEY_SIZE)) {
-    free(encrypted);
+    f.close();
     Serial.println(F("[VLT]  Key derivation failed"));
     return false;
   }
 
-  // Decrypt
-  size_t ptLen = 0;
-  uint8_t* plaintext = decryptData(key, encrypted, fileSize, &ptLen);
+  uint8_t buf[BLOCK_SIZE];
+  while (f.available() && vaultCount < MAX_CREDENTIAL_ITEMS) {
+    uint32_t offset = f.position();
+    size_t readLen = f.read(buf, BLOCK_SIZE);
+    if (readLen != BLOCK_SIZE) break;   // partial block = EOF or corruption
 
-  // Clear sensitive data
+    size_t ptLen = 0;
+    uint8_t* plaintext = decryptData(key, buf, BLOCK_SIZE, &ptLen);
+    if (plaintext && ptLen == sizeof(Credential)) {
+      Credential* cred = (Credential*)plaintext;
+      strlcpy(vaultIndex[vaultCount].name, cred->name, CREDENTIAL_NAME_LEN);
+      vaultIndex[vaultCount].fileOffset = offset;
+      vaultCount++;
+    }
+    if (plaintext) free(plaintext);
+  }
+
   memset(key, 0, sizeof(key));
-  free(encrypted);
+  f.close();
+  Serial.printf("[VLT]  Loaded %d entries from LittleFS\n", vaultCount);
+  return true;
+}
 
-  if (!plaintext) {
-    Serial.println(F("[VLT]  Decryption failed (wrong PIN or corrupted)"));
+// ─────────────────────────────────────────────────────────────────────────────
+// Save vault (re-encrypt all blocks) — used when PIN changes
+// Writes to /vault.tmp then renames over /vault.dat for crash safety
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool saveVault(const char* newPin) {
+  fs::File newF = LittleFS.open("/vault.tmp", "w");
+  if (!newF) return false;
+
+  uint8_t newKey[AES_KEY_SIZE];
+  if (!deriveKey(newPin, newKey, AES_KEY_SIZE)) {
+    newF.close();
     return false;
   }
 
-  // Parse JSON
-  bool ok = deserializeVault((const char*)plaintext);
-  free(plaintext);
-  return ok;
+  Credential tempCred;
+  bool success = true;
+
+  for (int i = 0; i < vaultCount; i++) {
+    if (!decryptEntry(i, sessionPin, &tempCred)) { success = false; break; }
+
+    size_t encLen = 0;
+    uint8_t* encrypted = encryptData(newKey, (const uint8_t*)&tempCred, sizeof(Credential), &encLen);
+    if (encrypted) {
+      uint32_t newOffset = newF.size();
+      newF.write(encrypted, encLen);
+      vaultIndex[i].fileOffset = newOffset;
+      free(encrypted);
+    } else {
+      success = false;
+      break;
+    }
+    memset(&tempCred, 0, sizeof(Credential));
+  }
+
+  memset(newKey, 0, sizeof(newKey));
+  newF.close();
+
+  if (success) {
+    LittleFS.remove(VAULT_FILE_PATH);
+    LittleFS.rename("/vault.tmp", VAULT_FILE_PATH);
+    return true;
+  }
+  LittleFS.remove("/vault.tmp");
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRUD helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool addCredential(const char* name, const char* user, const char* pass, const char* pin) {
+  Credential cred;
+  memset(&cred, 0, sizeof(Credential));
+  strlcpy(cred.name, name, CREDENTIAL_NAME_LEN);
+  strlcpy(cred.user, user, CREDENTIAL_USER_LEN);
+  strlcpy(cred.pass, pass, CREDENTIAL_PASS_LEN);
+  return appendCredentialBlock(&cred, pin);
+}
+
+static bool updateCredential(int index, const char* name, const char* user, const char* pass, const char* pin) {
+  if (index < 0 || index >= vaultCount) return false;
+
+  fs::File newF = LittleFS.open("/vault.tmp", "w");
+  if (!newF) return false;
+
+  uint8_t key[AES_KEY_SIZE];
+  if (!deriveKey(pin, key, AES_KEY_SIZE)) {
+    newF.close();
+    return false;
+  }
+
+  Credential tempCred;
+  bool success = true;
+
+  for (int i = 0; i < vaultCount; i++) {
+    if (!decryptEntry(i, pin, &tempCred)) { success = false; break; }
+
+    if (i == index) {
+      if (name && strlen(name) > 0) strlcpy(tempCred.name, name, CREDENTIAL_NAME_LEN);
+      if (user) strlcpy(tempCred.user, user, CREDENTIAL_USER_LEN);
+      if (pass && strlen(pass) > 0) strlcpy(tempCred.pass, pass, CREDENTIAL_PASS_LEN);
+      strlcpy(vaultIndex[i].name, tempCred.name, CREDENTIAL_NAME_LEN);
+    }
+
+    size_t encLen = 0;
+    uint8_t* encrypted = encryptData(key, (const uint8_t*)&tempCred, sizeof(Credential), &encLen);
+    if (encrypted) {
+      uint32_t newOffset = newF.size();
+      newF.write(encrypted, encLen);
+      vaultIndex[i].fileOffset = newOffset;
+      free(encrypted);
+    } else {
+      success = false;
+      break;
+    }
+    memset(&tempCred, 0, sizeof(Credential));
+  }
+
+  memset(key, 0, sizeof(key));
+  newF.close();
+
+  if (success) {
+    LittleFS.remove(VAULT_FILE_PATH);
+    LittleFS.rename("/vault.tmp", VAULT_FILE_PATH);
+    return true;
+  }
+  LittleFS.remove("/vault.tmp");
+  return false;
+}
+
+static bool deleteCredential(int index, const char* pin) {
+  if (index < 0 || index >= vaultCount) return false;
+
+  fs::File newF = LittleFS.open("/vault.tmp", "w");
+  if (!newF) return false;
+
+  uint8_t key[AES_KEY_SIZE];
+  if (!deriveKey(pin, key, AES_KEY_SIZE)) {
+    newF.close();
+    return false;
+  }
+
+  Credential tempCred;
+  bool success = true;
+  int newCount = 0;
+
+  for (int i = 0; i < vaultCount; i++) {
+    if (i == index) continue;   // skip deleted entry
+
+    if (!decryptEntry(i, pin, &tempCred)) { success = false; break; }
+
+    size_t encLen = 0;
+    uint8_t* encrypted = encryptData(key, (const uint8_t*)&tempCred, sizeof(Credential), &encLen);
+    if (encrypted) {
+      uint32_t newOffset = newF.size();
+      newF.write(encrypted, encLen);
+      strlcpy(vaultIndex[newCount].name, tempCred.name, CREDENTIAL_NAME_LEN);
+      vaultIndex[newCount].fileOffset = newOffset;
+      newCount++;
+      free(encrypted);
+    } else {
+      success = false;
+      break;
+    }
+    memset(&tempCred, 0, sizeof(Credential));
+  }
+
+  memset(key, 0, sizeof(key));
+  newF.close();
+
+  if (success) {
+    LittleFS.remove(VAULT_FILE_PATH);
+    LittleFS.rename("/vault.tmp", VAULT_FILE_PATH);
+    vaultCount = newCount;
+    return true;
+  }
+  LittleFS.remove("/vault.tmp");
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CSV Import Parser
-// Columns: Name, Username, Password  (extra columns beyond 3 are ignored)
-// Handles: quoted fields, Windows \r\n line endings, extra columns (url/notes)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Parse a single CSV field starting at *src.
-// Advances *src past the field and the following comma (if any).
-// Returns pointer into buf (null-terminated), strips surrounding quotes.
 static char* csvNextField(const char** src, const char* lineEnd,
                           char* buf, size_t bufLen) {
   const char* p = *src;
@@ -321,22 +478,19 @@ static char* csvNextField(const char** src, const char* lineEnd,
   if (p >= lineEnd) { buf[0] = '\0'; return buf; }
 
   if (*p == '"') {
-    // Quoted field
-    p++;  // skip opening quote
+    p++;
     while (p < lineEnd && out < bufLen - 1) {
       if (*p == '"') {
         p++;
-        if (p < lineEnd && *p == '"') { buf[out++] = '"'; p++; } // escaped ""
-        else break;  // closing quote
+        if (p < lineEnd && *p == '"') { buf[out++] = '"'; p++; }
+        else break;
       } else {
         buf[out++] = *p++;
       }
     }
-    // Advance to next comma or end
     while (p < lineEnd && *p != ',') p++;
     if (p < lineEnd && *p == ',') p++;
   } else {
-    // Unquoted field — stop at next comma
     while (p < lineEnd && *p != ',' && out < bufLen - 1) {
       buf[out++] = *p++;
     }
@@ -344,14 +498,13 @@ static char* csvNextField(const char** src, const char* lineEnd,
   }
 
   buf[out] = '\0';
-  // Strip trailing \r
   while (out > 0 && buf[out - 1] == '\r') { buf[--out] = '\0'; }
 
   *src = p;
   return buf;
 }
 
-static int importCSV(const char* csvData, size_t dataLen) {
+static int importCSV(const char* csvData, size_t dataLen, const char* pin) {
   int imported = 0;
   const char* ptr = csvData;
   const char* end = csvData + dataLen;
@@ -362,35 +515,27 @@ static int importCSV(const char* csvData, size_t dataLen) {
   char fPass[CREDENTIAL_PASS_LEN];
 
   while (ptr < end && vaultCount < MAX_CREDENTIAL_ITEMS) {
-    // Find end of line
     const char* lineEnd = ptr;
     while (lineEnd < end && *lineEnd != '\n' && *lineEnd != '\r') lineEnd++;
-
     size_t lineLen = lineEnd - ptr;
 
     if (lineLen > 0 && !firstLine) {
       const char* p = ptr;
-
-      // Col 0 — Name
       csvNextField(&p, lineEnd, fName, sizeof(fName));
-      // Col 1 — Username
       csvNextField(&p, lineEnd, fUser, sizeof(fUser));
-      // Col 2 — Password (stop here; extra columns are discarded)
       csvNextField(&p, lineEnd, fPass, sizeof(fPass));
-      // Any remaining columns (url, notes, etc.) are intentionally ignored
 
       if (strlen(fName) > 0 && strlen(fPass) > 0) {
-        strlcpy(vault[vaultCount].name, fName, CREDENTIAL_NAME_LEN);
-        strlcpy(vault[vaultCount].user, fUser, CREDENTIAL_USER_LEN);
-        strlcpy(vault[vaultCount].pass, fPass, CREDENTIAL_PASS_LEN);
-        vaultCount++;
-        imported++;
+        if (addCredential(fName, fUser, fPass, pin)) {
+          imported++;
+        }
       }
+      // Yield to FreeRTOS scheduler and reset TWDT to prevent WDT on bulk imports
+      yield();
+      esp_task_wdt_reset();
     }
 
     firstLine = false;
-
-    // Advance past line ending(s)
     ptr = lineEnd;
     while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ptr++;
   }
@@ -401,10 +546,9 @@ static int importCSV(const char* csvData, size_t dataLen) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // KeePass XML Import
-// Parses KeePass 2.x XML export format using tinyxml2
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int importKeePassXML(const char* xmlData, size_t dataLen) {
+static int importKeePassXML(const char* xmlData, size_t dataLen, const char* pin) {
   int imported = 0;
 
   tinyxml2::XMLDocument doc;
@@ -414,45 +558,22 @@ static int importKeePassXML(const char* xmlData, size_t dataLen) {
     return 0;
   }
 
-  // KeePass XML structure:
-  // <KeePassFile><Root><Group><Entry>
-  //   <String><Key>Title</Key><Value>...</Value></String>
-  //   <String><Key>UserName</Key><Value>...</Value></String>
-  //   <String><Key>Password</Key><Value>...</Value></String>
-  // </Entry></Group></Root></KeePassFile>
-
   tinyxml2::XMLElement* root = doc.FirstChildElement("KeePassFile");
-  if (!root) root = doc.FirstChildElement();  // Fallback
+  if (!root) root = doc.FirstChildElement();
   if (!root) return 0;
 
-  // Recursively search for Entry elements
-  // We use a simple iterative approach with a stack
-  struct NodeStack {
-    tinyxml2::XMLElement* elem;
-  };
-
-  // Find all <Entry> elements by traversing the tree
-  // Simple recursive lambda isn't available, so we use iteration
   tinyxml2::XMLElement* searchRoot = root;
-
-  // Try KeePass standard path first
   tinyxml2::XMLElement* kpRoot = root->FirstChildElement("Root");
   if (kpRoot) searchRoot = kpRoot;
 
-  // Iterate through all Group elements and their Entry children
-  // This handles nested groups
   for (tinyxml2::XMLElement* group = searchRoot->FirstChildElement();
        group != nullptr && vaultCount < MAX_CREDENTIAL_ITEMS;
        group = group->NextSiblingElement()) {
 
-    // Process entries at this level
     tinyxml2::XMLElement* entry = nullptr;
-
-    // Check if this element IS an Entry
     if (strcmp(group->Name(), "Entry") == 0) {
       entry = group;
     } else {
-      // Look for Entry children within this Group
       entry = group->FirstChildElement("Entry");
     }
 
@@ -461,7 +582,6 @@ static int importKeePassXML(const char* xmlData, size_t dataLen) {
       char username[CREDENTIAL_USER_LEN] = {0};
       char password[CREDENTIAL_PASS_LEN] = {0};
 
-      // Parse <String> elements within this Entry
       for (tinyxml2::XMLElement* str = entry->FirstChildElement("String");
            str != nullptr;
            str = str->NextSiblingElement("String")) {
@@ -484,19 +604,19 @@ static int importKeePassXML(const char* xmlData, size_t dataLen) {
         }
       }
 
-      // Import if we have at least a title
       if (strlen(title) > 0) {
-        strlcpy(vault[vaultCount].name, title, CREDENTIAL_NAME_LEN);
-        strlcpy(vault[vaultCount].user, username, CREDENTIAL_USER_LEN);
-        strlcpy(vault[vaultCount].pass, password, CREDENTIAL_PASS_LEN);
-        vaultCount++;
-        imported++;
+        if (addCredential(title, username, password, pin)) {
+          imported++;
+        }
       }
+      // Yield to FreeRTOS scheduler and reset TWDT
+      yield();
+      esp_task_wdt_reset();
 
       entry = entry->NextSiblingElement("Entry");
     }
 
-    // Also check for nested Group elements (one level deep)
+    // Check nested groups (one level deep)
     for (tinyxml2::XMLElement* subGroup = group->FirstChildElement("Group");
          subGroup != nullptr && vaultCount < MAX_CREDENTIAL_ITEMS;
          subGroup = subGroup->NextSiblingElement("Group")) {
@@ -532,12 +652,13 @@ static int importKeePassXML(const char* xmlData, size_t dataLen) {
         }
 
         if (strlen(title) > 0) {
-          strlcpy(vault[vaultCount].name, title, CREDENTIAL_NAME_LEN);
-          strlcpy(vault[vaultCount].user, username, CREDENTIAL_USER_LEN);
-          strlcpy(vault[vaultCount].pass, password, CREDENTIAL_PASS_LEN);
-          vaultCount++;
-          imported++;
+          if (addCredential(title, username, password, pin)) {
+            imported++;
+          }
         }
+        // Yield to FreeRTOS scheduler and reset TWDT
+        yield();
+        esp_task_wdt_reset();
       }
     }
   }
@@ -547,52 +668,14 @@ static int importKeePassXML(const char* xmlData, size_t dataLen) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Vault Utility Functions
+// Factory Reset
 // ─────────────────────────────────────────────────────────────────────────────
-
-static bool addCredential(const char* name, const char* user, const char* pass) {
-  if (vaultCount >= MAX_CREDENTIAL_ITEMS) return false;
-
-  strlcpy(vault[vaultCount].name, name, CREDENTIAL_NAME_LEN);
-  strlcpy(vault[vaultCount].user, user, CREDENTIAL_USER_LEN);
-  strlcpy(vault[vaultCount].pass, pass, CREDENTIAL_PASS_LEN);
-  vaultCount++;
-  return true;
-}
-
-static bool updateCredential(int index, const char* name, const char* user,
-                              const char* pass) {
-  if (index < 0 || index >= vaultCount) return false;
-
-  if (name && strlen(name) > 0)
-    strlcpy(vault[index].name, name, CREDENTIAL_NAME_LEN);
-  if (user)
-    strlcpy(vault[index].user, user, CREDENTIAL_USER_LEN);
-  if (pass && strlen(pass) > 0)
-    strlcpy(vault[index].pass, pass, CREDENTIAL_PASS_LEN);
-
-  return true;
-}
-
-static bool deleteCredential(int index) {
-  if (index < 0 || index >= vaultCount) return false;
-
-  // Shift entries down
-  for (int i = index; i < vaultCount - 1; i++) {
-    memcpy(&vault[i], &vault[i + 1], sizeof(Credential));
-  }
-  vaultCount--;
-
-  // Clear the now-unused slot
-  memset(&vault[vaultCount], 0, sizeof(Credential));
-  return true;
-}
 
 static void factoryReset() {
   LittleFS.remove(VAULT_FILE_PATH);
   LittleFS.remove(CONFIG_FILE_PATH);
   vaultCount = 0;
-  memset(vault, 0, sizeof(vault));
+  memset(vaultIndex, 0, sizeof(vaultIndex));
   memset(&deviceConfig, 0, sizeof(deviceConfig));
   deviceConfig.firstBoot = true;
   deviceConfig.displayTimeoutEnabled = true;
