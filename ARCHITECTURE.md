@@ -74,11 +74,11 @@ FiskeyPass/
 ├── BleKeyboard.h            — NimBLE 2.x HID keyboard wrapper
 ├── WebPortal.h              — Captive portal HTML/CSS/JS (PROGMEM, ~22 KB)
 ├── SplashImage.h            — RGB565 splash bitmap
-├── SecureLayerManager.h/.cpp — UNUSED (retained but not #included)
-├── TrafficObfuscationManager.h/.cpp — UNUSED (retained but not #included)
+
 ├── tinyxml2.h/.cpp          — KeePass XML parser
 ├── WIRING.md                — Hardware connection guide
-├── CONTEXT.md               — This file
+├── ARCHITECTURE.md          — Technical specifications and state machine
+├── CHANGELOG.md             — Version history and updates
 └── README.md                — User-facing documentation
 ```
 

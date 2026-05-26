@@ -140,7 +140,8 @@ Standard KeePass v2 XML export. Group structure is flattened; only `Title`, `Use
 | `SplashImage.h` | RGB565 splash screen bitmap |
 | `tinyxml2.h/.cpp` | KeePass XML parser |
 | `WIRING.md` | Full hardware connection guide & diagrams |
-| `CONTEXT.md` | Developer context and historical architecture notes |
+| `ARCHITECTURE.md` | Technical specifications and historical architecture notes |
+| `CHANGELOG.md` | Version history and update logs |
 
 ---
 *FiskeyPass. Secure your payload. Own your keys.*
