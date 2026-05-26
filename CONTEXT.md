@@ -1,19 +1,17 @@
-# FiskeyPass v4 — Complete Project Context
+# 🧠 CONTEXT.md — FiskeyPass v4 Complete Project Context
 
-> **Purpose**: This file captures ALL project history, decisions, architecture, and current state so development can continue in a fresh conversation with zero context loss.
->
-> **Last updated**: 2026-05-15
+> **🎯 Purpose**: This file captures ALL project history, decisions, architecture, and current state so development can continue in a fresh conversation with zero context loss.
 
 ---
 
-## 1. Project Identity
+## 1️⃣ Quick Specs
 
-| Field | Value |
-|---|---|
-| **Project Name** | FiskeyPass (spelling: F-i-s-k-e-y, NOT "Fiksey") |
-| **Folder** | `C:\Users\u\Documents\Projects\FiskeyPass\` |
+| Category | Specification |
+| :--- | :--- |
 | **Main file** | `FiskeyPass.ino` (must match folder name for Arduino IDE) |
 | **Hardware** | ESP32 DevKit V1 + 1.8" ST7735 TFT (128×160) |
+| **Purpose** | Encrypted hardware password vault with BLE HID keyboard |
+| **Version** | v4.0.0 |
 | **Purpose** | Encrypted hardware password vault with BLE HID keyboard |
 | **Version** | v4 |
 

@@ -1,8 +1,8 @@
-# WIRING.md — FiskeyPass v4 Hardware Connection Guide
-## ESP32 ↔ ST7735 TFT + Navigation Buttons
+# 🔌 WIRING.md — FiskeyPass v4 Hardware Connection Guide
 
-> **v4**: SD card removed since v2.5.1. Storage is handled by the
-> **ESP32 internal 4 MB flash via LittleFS** — no external SD card needed.
+## 🔲 ESP32 ↔ ST7735 TFT + Navigation Buttons
+
+> ⚠️ **v4 Update**: SD card support has been completely removed. Storage is handled entirely by the **ESP32 internal 4 MB flash via LittleFS**. No external SD card is needed.
 
 ---
 
