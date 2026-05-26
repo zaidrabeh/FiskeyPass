@@ -1,4 +1,4 @@
-# FiskeyPass v3.0.1 — Complete Project Context
+# FiskeyPass v4 — Complete Project Context
 
 > **Purpose**: This file captures ALL project history, decisions, architecture, and current state so development can continue in a fresh conversation with zero context loss.
 >
@@ -15,7 +15,7 @@
 | **Main file** | `FiskeyPass.ino` (must match folder name for Arduino IDE) |
 | **Hardware** | ESP32 DevKit V1 + 1.8" ST7735 TFT (128×160) |
 | **Purpose** | Encrypted hardware password vault with BLE HID keyboard |
-| **Version** | v3.0.1 |
+| **Version** | v4 |
 
 ---
 
@@ -47,7 +47,7 @@
 
 ### Phase 5 — v2.2 (Security & Logic Fixes)
 - **AZERTY Layout**: Rewrote `asciiToHID` to support French AZERTY layouts
-- **Web Portal Lock-down**: Added portal credential setup page + HTTP Basic Auth (later replaced in v3.0.1)
+- **Web Portal Lock-down**: Added portal credential setup page + HTTP Basic Auth (later replaced in v4)
 - **BLE Connection Logic**: Removed continuous advertising post-connection
 
 ### Phase 6 — v3.0.0 (Security Layer Upgrade Attempt)
@@ -55,7 +55,7 @@
 - These introduced mbedtls ECDH dependencies and complex JS `secureFetch()` wrappers
 - `secureFetch()` was never defined in the JS — all authenticated API calls silently failed
 
-### Phase 7 — v3.0.1 (Architecture Hardening — CURRENT)
+### Phase 7 — v4 (Architecture Hardening — CURRENT)
 - **Blank Key Bug Fixed**: `sessionPin` was never populated in the portal path, so `saveVault("")` encrypted with a blank-derived key, making the vault unreadable on reboot
 - **Purged ECDH complexity**: Removed `SecureLayerManager`, `TrafficObfuscationManager`, `secureFetch()`, `authenticatedClients` set, and all `X-Client-ID` auth
 - **PIN unlock modal**: Replaced the old login-credential system with a mandatory 4-digit device PIN entry in the browser (`POST /api/vault-unlock`)
@@ -112,7 +112,7 @@ FiskeyPass/
 
 ---
 
-## 5. v3.0.1 Architecture
+## 5. v4 Architecture
 
 ### 5.1 State Machine
 ```
@@ -139,7 +139,7 @@ BOOT
 - **Key Derivation**: PBKDF2-SHA256(PIN + ESP32 MAC salt, 10,000 iterations)
 - **Storage**: `/vault.enc` on LittleFS
 
-### 5.3 Web Portal (v3.0.1)
+### 5.3 Web Portal (v4)
 - **Network Security**: WPA2-PSK (`FiskeyPass-Setup` / `FiskeyAdmin123`)
 - **Vault Security**: Mandatory PIN unlock modal on every session (`POST /api/vault-unlock`)
 - **Auth gate**: `vaultUnlocked` boolean (static global in `FiskeyPass.ino`) — all API routes call `requireUnlock()` before any operation

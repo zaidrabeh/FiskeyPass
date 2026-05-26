@@ -1,4 +1,4 @@
-# FiskeyPass v3.0.1
+# FiskeyPass v4
 
 FiskeyPass is an open-source, encrypted hardware password vault built on the ESP32. It uses AES-256-GCM encryption, a built-in NimBLE HID keyboard for password injection, and a completely offline, air-gapped web portal for importing and managing credentials — all without any cloud connectivity.
 
