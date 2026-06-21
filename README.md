@@ -1,13 +1,13 @@
-<img width="456" height="547" alt="FiskeyPass no bg" src="https://github.com/user-attachments/assets/a5576797-5d08-46b8-bb1c-bc89eb204bcb" />
+<div align="center">
+  <img width="300" alt="FiskeyPass Logo" src="fiskeypass-logo.png" />
 
 # 🔐 FiskeyPass v4.0.0
 
-<p align="center">
   <img src="https://img.shields.io/badge/Hardware-ESP32-blue?style=for-the-badge&logo=espressif" />
   <img src="https://img.shields.io/badge/Storage-LittleFS-green?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Encryption-AES--256--GCM-red?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Protocol-BLE_HID-yellow?style=for-the-badge&logo=bluetooth" />
-</p>
+</div>
 
 **FiskeyPass** is an open-source, encrypted hardware password vault built on the **ESP32**. It uses military-grade AES-256-GCM block encryption, a built-in NimBLE HID keyboard for seamless password injection, and a completely offline, air-gapped web portal for importing and managing credentials — all without a single byte leaving the device.
 
