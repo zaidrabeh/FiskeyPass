@@ -1,5 +1,5 @@
 // =============================================================================
-// Project_Config.h — FiskeyPass v4.0.0 Central Hardware & Application Configuration
+// Project_Config.h — FiskeyPass v4.0.1 Central Hardware & Application Configuration
 // =============================================================================
 //
 // PURPOSE:
@@ -11,7 +11,7 @@
 //   line of FiskeyPass.ino.
 //
 // STORAGE:
-//   v2.0 uses ESP32 internal 4MB flash via LittleFS. No external SD card.
+//   The firmware uses ESP32 internal 4MB flash via LittleFS. No external SD card.
 // =============================================================================
 
 #ifndef PROJECT_CONFIG_H
@@ -75,8 +75,8 @@
 
 #define FISKEYPASS_VERSION_MAJOR 4
 #define FISKEYPASS_VERSION_MINOR 0
-#define FISKEYPASS_VERSION_PATCH 0
-#define FISKEYPASS_VERSION_STR   "v4.0.0"
+#define FISKEYPASS_VERSION_PATCH 1
+#define FISKEYPASS_VERSION_STR   "v4.0.1"
 
 // =============================================================================
 // SECTION 6 — NAVIGATION BUTTON PINS
@@ -110,7 +110,7 @@ static constexpr int CREDENTIAL_PASS_LEN   = 64;
 // SECTION 9 — SECURITY CONSTANTS
 // =============================================================================
 
-static constexpr int  PIN_LENGTH         = 6;      // 6-digit numeric PIN
+static constexpr int  PIN_LENGTH         = 6;      // 6-character alphanumeric PIN
 static constexpr int  PBKDF2_ITERATIONS  = 10000;  // Key derivation rounds
 static constexpr int  MAX_PIN_ATTEMPTS   = 5;      // Before lockout
 static constexpr unsigned long LOCKOUT_DURATION_MS = 60000;  // 60 second lockout
@@ -131,6 +131,9 @@ static constexpr int  GCM_TAG_SIZE       = 16;     // 128-bit auth tag
 
 #define BLE_DEVICE_NAME    "FiskeyPass"
 #define AP_SSID            "FiskeyPass-Setup"
+// AP_PASSWORD is no longer used: the portal now derives a per-device WPA2
+// password from the chip MAC at runtime and shows it on the TFT. Kept only
+// for reference / older builds.
 #define AP_PASSWORD        "FiskeyAdmin123"
 #define AP_DNS_PORT        53
 

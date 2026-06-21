@@ -1,5 +1,5 @@
 // =============================================================================
-// WebPortal.h — FiskeyPass v4.0.0 Dark-Themed Web Dashboard (PROGMEM)
+// WebPortal.h — FiskeyPass v4.0.1 Dark-Themed Web Dashboard (PROGMEM)
 // =============================================================================
 //
 // Complete captive portal HTML/CSS/JS as PROGMEM strings.
@@ -9,10 +9,10 @@
 // Dark palette: #0d1117 bg, #161b22 cards, #58a6ff accent, #f0f6fc text
 // 4 tabs: Dashboard | Vault | Import | Settings
 //
-// SECURITY MODEL (v4.0.0):
+// SECURITY MODEL (v4.0.1):
 //   - WPA2-PSK protects the AP at the network level.
 //   - A mandatory PIN unlock modal gates ALL dashboard access.
-//   - The PIN is the user's physical 6-digit FiskeyPass PIN.
+//   - The PIN is the user's physical 6-character FiskeyPass PIN.
 //   - Passwords are NEVER sent in HTTP GET responses.
 //   - All API calls are plain HTTP/JSON — no ECDH or HTTPS.
 // =============================================================================
@@ -152,7 +152,7 @@ max-width:400px;width:90%;text-align:center;}
 <!-- Header -->
 <div class="header">
 <h1>Fiskey<span>Pass</span></h1>
-<div class="ver">v4.0.0 &middot; Secure Portal</div>
+<div class="ver">v4.0.1 &middot; Secure Portal</div>
 </div>
 
 <!-- Tabs -->
@@ -243,9 +243,9 @@ Entries will be appended to your existing vault.
 <div class="card">
 <h2>Change PIN</h2>
 <label>Current PIN</label>
-<input type="password" id="pin-old" placeholder="Enter current 6-digit PIN" maxlength="6">
+<input type="password" id="pin-old" placeholder="Enter current 6-char PIN" maxlength="6">
 <label>New PIN</label>
-<input type="password" id="pin-new" placeholder="Enter new 6-digit PIN" maxlength="6">
+<input type="password" id="pin-new" placeholder="Enter new 6-char PIN" maxlength="6">
 <label>Confirm New PIN</label>
 <input type="password" id="pin-conf" placeholder="Repeat new PIN" maxlength="6">
 <div class="actions">
@@ -270,7 +270,7 @@ Factory reset will erase ALL stored credentials and settings. This cannot be und
 <h3>Vault Locked</h3>
 <p>Enter your FiskeyPass physical PIN to unlock the vault.</p>
 <input type="password" id="pin-unlock" placeholder="------" maxlength="6"
-       inputmode="numeric" pattern="[0-9]*" autocomplete="off">
+       autocomplete="off">
 <div class="actions" style="justify-content:center;margin-top:14px;">
 <button class="btn btn-primary" id="pin-unlock-btn" onclick="doUnlock()" style="width:100%;max-width:200px;">Unlock Vault</button>
 </div>
@@ -303,7 +303,7 @@ function doUnlock(){
   var pin=document.getElementById('pin-unlock').value.trim();
   var err=document.getElementById('pin-err');
   var btn=document.getElementById('pin-unlock-btn');
-  if(pin.length!==6||!/^\d{6}$/.test(pin)){err.textContent='PIN must be exactly 6 digits';return;}
+  if(pin.length!==6){err.textContent='PIN must be exactly 6 characters';return;}
   err.textContent='';
   btn.disabled=true; btn.textContent='Unlocking...';
   fetch('/api/vault-unlock',{
@@ -461,7 +461,7 @@ function changePin(){
   var o=document.getElementById('pin-old').value;
   var n=document.getElementById('pin-new').value;
   var c=document.getElementById('pin-conf').value;
-  if(o.length!==6||n.length!==6){toast('PIN must be 6 digits',false);return;}
+  if(o.length!==6||n.length!==6){toast('PIN must be 6 characters',false);return;}
   if(n!==c){toast('New PINs do not match',false);return;}
   fetch('/api/pin',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({old:o,"new":n})

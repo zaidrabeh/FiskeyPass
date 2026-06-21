@@ -13,9 +13,9 @@
 
 ## ✨ Core Features
 
-*   **🛡️ AES-256-GCM Encryption**: All credentials are encrypted at rest on the ESP32's internal flash (`LittleFS`) via block streaming. The encryption key is derived using PBKDF2-SHA256 from your 6-digit PIN and the ESP32's unique hardware MAC address as salt.
+*   **🛡️ AES-256-GCM Encryption**: All credentials are encrypted at rest on the ESP32's internal flash (`LittleFS`) via block streaming. The encryption key is derived using PBKDF2-SHA256 from your 6-character alphanumeric PIN and the ESP32's unique hardware MAC address as salt.
 *   **⌨️ Bluetooth LE HID Keyboard**: Select a password on the device's screen and it instantly "types" it into any paired smartphone, tablet, or PC like a standard Bluetooth keyboard.
-*   **🌐 Air-Gapped Web Dashboard**: The device broadcasts its own WPA2-secured Wi-Fi network (`FiskeyPass-Setup`). Connecting presents a dark-themed dashboard to manage credentials, change your PIN, and import KeePass XML or CSV files. Access requires your physical 6-digit device PIN — no separate portal credentials needed.
+*   **🌐 Air-Gapped Web Dashboard**: The device broadcasts its own WPA2-secured Wi-Fi network (`FiskeyPass-Setup`). Connecting presents a dark-themed dashboard to manage credentials, change your PIN, and import KeePass XML or CSV files. Access requires your physical 6-character device PIN — no separate portal credentials needed.
 *   **🔒 RAM Security Model**: The web dashboard enforces a mandatory PIN unlock modal on every session. The vault is never fully decrypted in memory at once; blocks are decrypted on-demand and wiped instantly.
 *   **📦 Zero External Dependencies**: Uses the ESP32 internal flash exclusively. No SD cards, no cloud sync, no external APIs.
 
@@ -72,7 +72,7 @@ FiskeyPass requires **ESP32 Core v3.x** and specific library versions to compile
 ## 🎮 Usage Guide
 
 ### 🟢 First Boot
-The device prompts you to create a new **6-digit PIN**. Use `UP`/`DOWN` to cycle digits and `SELECT` to confirm each one.
+The device prompts you to create a new **6-character PIN** (letters and digits). Use `UP`/`DOWN` to cycle each character (hold to cycle quickly) and `SELECT` to confirm each one.
 
 ### 🟡 Normal Operation
 After PIN entry, the vault decrypts its index and you land on the Main Menu. Navigate with `UP`/`DOWN`, confirm with `SELECT`, go back with `RETURN`.
@@ -81,15 +81,15 @@ After PIN entry, the vault decrypts its index and you land on the Main Menu. Nav
 *   **Settings**: Change display timeout, change PIN.
 
 ### 🔵 Web Portal
-1. Select **Web Portal** from the Main Menu. The device reboots and broadcasts `FiskeyPass-Setup` (password: `FiskeyAdmin123`).
+1. Select **Web Portal** from the Main Menu. The device reboots and broadcasts `FiskeyPass-Setup`. The **per-device WPA2 password is shown on the TFT** (a unique `FP########` derived from the chip MAC — not a shared default).
 2. Connect your phone or PC to that Wi-Fi network — your browser will be redirected automatically to the local IP.
-3. Enter your **device 6-digit PIN** in the unlock modal. The vault index decrypts into memory.
+3. Enter your **device 6-character PIN** in the unlock modal. The vault index decrypts into memory.
 4. Manage entries, import CSV/KeePass XML, change PIN, or factory reset.
 5. Hold `RETURN` for 2 seconds on the device to exit and reboot back to normal mode.
 
 ### 🟣 Typing Passwords via BLE
 1. On the device, navigate to a credential and select **Type Password**.
-2. On your phone/PC, pair with the Bluetooth device named `FiskeyPass`. Enter passkey `123456` when prompted.
+2. On your phone/PC, pair with the Bluetooth device named `FiskeyPass`. The host shows a **random 6-digit passkey**; type that code on the FiskeyPass (UP/DOWN to cycle digits, SELECT to confirm, RETURN to cancel) to authorise the bond.
 3. The ESP32 types the password directly into the focused text field.
 
 ---
@@ -113,11 +113,11 @@ Standard KeePass v2 XML export. Group structure is flattened; only `Title`, `Use
 
 | Layer | Mechanism |
 | :--- | :--- |
-| **Network** | WPA2-PSK (`FiskeyAdmin123`) — blocks unauthenticated Wi-Fi connections |
-| **Portal Access** | Mandatory 6-digit PIN unlock modal on every session |
-| **Vault at Rest** | Block-streamed AES-256-GCM, key derived via PBKDF2-SHA256 (PIN + MAC salt, 10,000 iterations) |
+| **Network** | WPA2-PSK with a per-device password (unique per unit, shown on the TFT) — blocks unauthenticated Wi-Fi connections |
+| **Portal Access** | Mandatory 6-character PIN unlock modal on every session |
+| **Vault at Rest** | Block-streamed AES-256-GCM, key derived via PBKDF2-SHA256 (PIN + MAC salt, 10,000 iterations); each block authenticates its position (GCM AAD) against reordering |
 | **Radio Isolation** | BLE and Wi-Fi never run simultaneously — reboot flag pattern prevents coexistence crashes and dual-attack vectors |
-| **PIN Lockout** | 5 wrong attempts triggers a 60-second hardware lockout |
+| **PIN Lockout** | 5 wrong attempts triggers a 60-second lockout (on-device and web portal) |
 | **Flash Binding** | Encryption salt includes the ESP32's unique MAC. Desoldering the flash chip to attack it offline is useless unless the exact ESP32 MAC is known. |
 
 ### Security Notes

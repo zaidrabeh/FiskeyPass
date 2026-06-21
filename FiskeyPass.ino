@@ -1,5 +1,5 @@
 // =============================================================================
-// FiskeyPass.ino — v4.0.0 Main Firmware
+// FiskeyPass.ino — v4.0.1 Main Firmware
 // =============================================================================
 //
 // ARCHITECTURE (state machine):
@@ -73,6 +73,7 @@ enum AppState {
   STATE_SETTINGS,
   STATE_SETTINGS_INFO,
   STATE_SETTINGS_DISP,
+  STATE_BLE_PAIR,         // Host requested passkey entry during BLE pairing
   STATE_WEB_PORTAL        // AP captive portal mode
 };
 
@@ -94,9 +95,24 @@ AsyncWebServer webServer(80);
 // --- PIN entry ---
 char     pinBuffer[PIN_LENGTH + 1] = {0}; // digits typed so far
 uint8_t  pinDigitIndex = 0;               // which digit we are setting (0-3)
-uint8_t  pinDigitValue[PIN_LENGTH] = {0}; // current digit 0-9 for each box
+uint8_t  pinDigitValue[PIN_LENGTH] = {0}; // charset index for each box
 int      pinAttempts   = 0;               // wrong-PIN counter
 unsigned long lockoutStart = 0;           // millis() when lockout began
+
+// PIN charset. The unlock/create PIN is alphanumeric. Trimmed to digits +
+// lowercase (36 chars → 36^6 ≈ 2.2e9, still ~2000x the old 10^6 space) to keep
+// button cycling fast; add A-Z for 62^6 if you prefer max entropy over speed.
+// BLE pairing keeps a numeric-only charset (BLE passkeys are 6-digit numbers).
+// pinDigitValue[] holds an index into activeCharset.
+static const char  PIN_CHARSET[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+static const char  NUM_CHARSET[] = "0123456789";
+const char* activeCharset    = PIN_CHARSET;
+int         activeCharsetLen = sizeof(PIN_CHARSET) - 1;
+
+// Web-portal PIN brute-force guard (mirrors the device-side lockout so the
+// /api/vault-unlock route cannot be hammered through the 10^6 PIN space)
+int      webPinAttempts  = 0;
+unsigned long webLockoutStart = 0;
 
 // Session PIN (kept in RAM to re-encrypt on vault save; cleared on reset/reboot)
 char sessionPin[PIN_LENGTH + 1] = {0};
@@ -128,6 +144,7 @@ struct Button {
   const int8_t  pin;
   bool          lastState;
   unsigned long lastPress;
+  unsigned long repeatAt;     // next auto-repeat fire time (0 = not repeating)
 
   bool pressed() {
     bool cur = (digitalRead(pin) == LOW);
@@ -145,13 +162,33 @@ struct Button {
   bool held() {
     return (digitalRead(pin) == LOW);
   }
+
+  // Like pressed(), but auto-repeats while held: fires once on press, then after
+  // an initial delay repeats rapidly. Used for fast value cycling in PIN entry.
+  bool repeat() {
+    bool cur = (digitalRead(pin) == LOW);
+    if (cur && !lastState && (millis() - lastPress > DEBOUNCE_MS)) {
+      lastState = true;
+      lastPress = millis();
+      lastActivity = millis();
+      repeatAt = millis() + 450;   // initial hold delay before auto-repeat
+      return true;
+    }
+    if (cur && lastState && repeatAt && millis() >= repeatAt) {
+      repeatAt = millis() + 90;    // auto-repeat interval
+      lastActivity = millis();
+      return true;
+    }
+    if (!cur) { lastState = false; repeatAt = 0; }
+    return false;
+  }
 };
 
 // Four button instances
-Button btnUp     = {PIN_BTN_UP,     false, 0};
-Button btnDown   = {PIN_BTN_DOWN,   false, 0};
-Button btnSelect = {PIN_BTN_SELECT, false, 0};
-Button btnReturn = {PIN_BTN_RETURN, false, 0};
+Button btnUp     = {PIN_BTN_UP,     false, 0, 0};
+Button btnDown   = {PIN_BTN_DOWN,   false, 0, 0};
+Button btnSelect = {PIN_BTN_SELECT, false, 0, 0};
+Button btnReturn = {PIN_BTN_RETURN, false, 0, 0};
 
 // =============================================================================
 // SECTION 6 — DISPLAY UTILITY FUNCTIONS
@@ -334,6 +371,8 @@ void drawLockout();
 void loopLockout();
 void setupWebPortalRoutes();
 void loopWebPortal();
+void drawBlePair();
+void loopBlePair();
 void drawPinScreen(bool isCreating, uint8_t activeDigit, const char* title,
                    const char* statusMsg = nullptr, uint16_t statusCol = 0x7BEF);
 
@@ -343,7 +382,7 @@ void drawPinScreen(bool isCreating, uint8_t activeDigit, const char* title,
 
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("\n[BOOT] FiskeyPass v4.0.0 starting"));
+  Serial.println(F("\n[BOOT] FiskeyPass v4.0.1 starting"));
 
   // ── GPIO init ──────────────────────────────────────────────────────────────
   pinMode(PIN_BTN_UP,     INPUT_PULLUP);
@@ -371,7 +410,7 @@ void setup() {
     memset(rtcSessionPin, 0, sizeof(rtcSessionPin));
     memset(sessionPin, 0, sizeof(sessionPin));
 
-    Serial.println(F("[BOOT] Portal flag found — Entering Web Portal Mode (v4.0.0)"));
+    Serial.println(F("[BOOT] Portal flag found — Entering Web Portal Mode (v4.0.1)"));
     appState = STATE_WEB_PORTAL;
     enterWebPortalMode();
     return;
@@ -398,6 +437,16 @@ void loop() {
     return;
   }
 
+  // BLE host requested passkey entry — interrupt the UI to collect the code
+  if (bleKeyboard.pairPinRequested && appState != STATE_BLE_PAIR &&
+      bleKeyboard.bleIsInitialized()) {
+    appState = STATE_BLE_PAIR;
+    pinDigitIndex = 0;
+    memset(pinDigitValue, 0, sizeof(pinDigitValue));
+    wakeScreen();
+    drawBlePair();
+  }
+
   // Route to the active state handler
   switch (appState) {
     case STATE_PIN_CREATE: loopPinEntry(true);   break;
@@ -409,6 +458,7 @@ void loop() {
     case STATE_SETTINGS:   loopSettings();        break;
     case STATE_SETTINGS_INFO: loopSettingsInfo(); break;
     case STATE_SETTINGS_DISP: loopSettingsDisp(); break;
+    case STATE_BLE_PAIR:   loopBlePair();         break;
     case STATE_WEB_PORTAL: loopWebPortal();       break;
     default: break;
   }
@@ -503,6 +553,8 @@ void drawSplash() {
 
 // Reset the digit array and index to start fresh
 void enterPinEntry(bool isFirstBoot) {
+  activeCharset = PIN_CHARSET;   // alphanumeric for unlock/create
+  activeCharsetLen = sizeof(PIN_CHARSET) - 1;
   pinDigitIndex = 0;
   memset(pinDigitValue, 0, sizeof(pinDigitValue));
   memset(pinBuffer,     0, sizeof(pinBuffer));
@@ -562,9 +614,20 @@ void drawPinScreen(bool isCreating, uint8_t activeDigit, const char* title,
       // Current digit being set — show live value
       tft.setTextColor(COL_TITLE, COL_BG);
       tft.setCursor(bx + 5, boxY + 5);
-      tft.print(pinDigitValue[i]);
+      tft.print(activeCharset[pinDigitValue[i]]);
     }
     // Future digits remain blank
+  }
+
+  // Position indicator: which character of PIN_LENGTH is being entered
+  {
+    char pos[20];
+    snprintf(pos, sizeof(pos), "Char %d of %d", activeDigit + 1, PIN_LENGTH);
+    tft.setTextSize(1);
+    tft.setTextColor(COL_DIM, COL_BG);
+    int px = (tft.width() - (int)strlen(pos) * 6) / 2;
+    tft.setCursor(max(px, 2), 76);
+    tft.print(pos);
   }
 
   // Status / error message area at bottom
@@ -594,8 +657,10 @@ static bool    awaitingConfirm = false;   // true once first pass of PIN is done
 
 // ── loopPinEntry — called every loop() tick while in PIN_ENTRY / PIN_CREATE ──
 void loopPinEntry(bool isFirstBoot) {
-  bool up  = btnUp.pressed();
-  bool dn  = btnDown.pressed();
+  activeCharset = PIN_CHARSET;   // alphanumeric unlock/create
+  activeCharsetLen = sizeof(PIN_CHARSET) - 1;
+  bool up  = btnUp.repeat();     // hold to fast-cycle characters
+  bool dn  = btnDown.repeat();
   bool sel = btnSelect.pressed();
   bool ret = btnReturn.pressed();
 
@@ -604,11 +669,11 @@ void loopPinEntry(bool isFirstBoot) {
   // ── First-boot: two-pass new PIN creation ────────────────────────────────
   if (isFirstBoot) {
     if (up) {
-      pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + 1) % 10;
+      pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + 1) % activeCharsetLen;
       drawPinScreen(true, pinDigitIndex, awaitingConfirm ? "Confirm PIN" : "Set New PIN");
     }
     if (dn) {
-      pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + 9) % 10;  // wrap 0→9
+      pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + activeCharsetLen - 1) % activeCharsetLen;
       drawPinScreen(true, pinDigitIndex, awaitingConfirm ? "Confirm PIN" : "Set New PIN");
     }
     if (sel) {
@@ -617,9 +682,9 @@ void loopPinEntry(bool isFirstBoot) {
       if (pinDigitIndex < PIN_LENGTH) {
         drawPinScreen(true, pinDigitIndex, awaitingConfirm ? "Confirm PIN" : "Set New PIN");
       } else {
-        // All 4 digits entered
+        // All characters entered
         char entered[PIN_LENGTH + 1];
-        for (int i = 0; i < PIN_LENGTH; i++) entered[i] = '0' + pinDigitValue[i];
+        for (int i = 0; i < PIN_LENGTH; i++) entered[i] = activeCharset[pinDigitValue[i]];
         entered[PIN_LENGTH] = '\0';
 
         if (!awaitingConfirm) {
@@ -643,8 +708,6 @@ void loopPinEntry(bool isFirstBoot) {
               delay(800);
               // Vault starts empty on first boot — no load needed
               vaultCount = 0;
-              
-              addCredential("Test BLE", "testuser", "testpass123", sessionPin);
 
               // Init BLE now that we are past portal mode
               bleKeyboard.bleInit();
@@ -677,11 +740,11 @@ void loopPinEntry(bool isFirstBoot) {
 
   // ── Normal PIN verify ────────────────────────────────────────────────────
   if (up) {
-    pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + 1) % 10;
+    pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + 1) % activeCharsetLen;
     drawPinScreen(false, pinDigitIndex, "Enter PIN");
   }
   if (dn) {
-    pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + 9) % 10;
+    pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + activeCharsetLen - 1) % activeCharsetLen;
     drawPinScreen(false, pinDigitIndex, "Enter PIN");
   }
   if (sel) {
@@ -689,9 +752,9 @@ void loopPinEntry(bool isFirstBoot) {
     if (pinDigitIndex < PIN_LENGTH) {
       drawPinScreen(false, pinDigitIndex, "Enter PIN");
     } else {
-      // All 4 digits entered — verify
+      // All characters entered — verify
       char entered[PIN_LENGTH + 1];
-      for (int i = 0; i < PIN_LENGTH; i++) entered[i] = '0' + pinDigitValue[i];
+      for (int i = 0; i < PIN_LENGTH; i++) entered[i] = activeCharset[pinDigitValue[i]];
       entered[PIN_LENGTH] = '\0';
 
       if (verifyPin(entered)) {
@@ -707,10 +770,6 @@ void loopPinEntry(bool isFirstBoot) {
           // File exists but decryption failed — should not happen if PIN is correct
           drawCentredMsg("Vault Error", "Data may be corrupt", COL_RED, COL_DIM);
           delay(1500);
-        }
-
-        if (vaultCount == 0) {
-          addCredential("Test BLE", "testuser", "testpass123", sessionPin);
         }
 
         bleKeyboard.bleInit();
@@ -741,6 +800,72 @@ void loopPinEntry(bool isFirstBoot) {
     pinDigitIndex--;
     pinDigitValue[pinDigitIndex] = 0;
     drawPinScreen(false, pinDigitIndex, "Enter PIN");
+  }
+}
+
+// =============================================================================
+// 2.3b  BLE pairing passkey entry (KeyboardOnly IO cap)
+//   The host shows a random 6-digit code; the user types it here to authorise
+//   the bond. Reuses the PIN digit buffers (idle while the vault is unlocked).
+// =============================================================================
+
+void drawBlePair() {
+  activeCharset = NUM_CHARSET;   // BLE passkeys are numeric
+  activeCharsetLen = sizeof(NUM_CHARSET) - 1;
+  drawPinScreen(false, pinDigitIndex, "BLE Pairing", "Type code shown on host", COL_DIM);
+}
+
+void loopBlePair() {
+  activeCharset = NUM_CHARSET;
+  activeCharsetLen = sizeof(NUM_CHARSET) - 1;
+  // Host aborted/disconnected — bail back to the menu
+  if (!bleKeyboard.pairPinRequested) {
+    pinDigitIndex = 0;
+    memset(pinDigitValue, 0, sizeof(pinDigitValue));
+    appState = STATE_MAIN_MENU;
+    drawMainMenu();
+    return;
+  }
+
+  bool up  = btnUp.repeat();     // hold to fast-cycle digits
+  bool dn  = btnDown.repeat();
+  bool sel = btnSelect.pressed();
+  bool ret = btnReturn.pressed();
+  if (!up && !dn && !sel && !ret) return;
+
+  if (up) { pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + 1) % activeCharsetLen; drawBlePair(); }
+  if (dn) { pinDigitValue[pinDigitIndex] = (pinDigitValue[pinDigitIndex] + activeCharsetLen - 1) % activeCharsetLen; drawBlePair(); }
+
+  if (sel) {
+    pinDigitIndex++;
+    if (pinDigitIndex < PIN_LENGTH) {
+      drawBlePair();
+    } else {
+      uint32_t code = 0;
+      for (int i = 0; i < PIN_LENGTH; i++) code = code * 10 + pinDigitValue[i];
+      bleKeyboard.blePairSubmit(code);
+      drawCentredMsg("Pairing...", "Check host device", COL_GREEN, COL_DIM);
+      delay(800);
+      pinDigitIndex = 0;
+      memset(pinDigitValue, 0, sizeof(pinDigitValue));
+      appState = STATE_MAIN_MENU;
+      drawMainMenu();
+    }
+  }
+
+  if (ret) {
+    if (pinDigitIndex > 0) {
+      pinDigitIndex--;
+      pinDigitValue[pinDigitIndex] = 0;
+      drawBlePair();
+    } else {
+      // Cancel pairing
+      bleKeyboard.blePairCancel();
+      pinDigitIndex = 0;
+      memset(pinDigitValue, 0, sizeof(pinDigitValue));
+      appState = STATE_MAIN_MENU;
+      drawMainMenu();
+    }
   }
 }
 
@@ -818,10 +943,16 @@ void enterWebPortalMode() {
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setCursor(4, 32); tft.print("Starting AP...");
 
+  // Per-device WPA2 password derived from the chip MAC — unique per unit and
+  // shown only on the physical TFT below, replacing the shared published default.
+  char apPass[16];
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(apPass, sizeof(apPass), "FP%08X", (uint32_t)(mac & 0xFFFFFFFFu));
+
   // Start WiFi access point (secured with WPA2-PSK)
   WiFi.mode(WIFI_AP);
   delay(100);
-  bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  bool ok = WiFi.softAP(AP_SSID, apPass);
   delay(300);
 
   if (!ok) {
@@ -855,19 +986,24 @@ void enterWebPortalMode() {
   tft.setTextSize(1);
   tft.setTextColor(COL_TEXT, COL_BG);
 
-  tft.setCursor(4, 32); tft.print("SSID:");
+  tft.setCursor(4, 30); tft.print("SSID:");
   tft.setTextColor(COL_TITLE, COL_BG);
-  tft.setCursor(4, 44); tft.print(AP_SSID);
+  tft.setCursor(40, 30); tft.print(AP_SSID);
+
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.setCursor(4, 44); tft.print("PASS:");
+  tft.setTextColor(COL_TITLE, COL_BG);
+  tft.setCursor(40, 44); tft.print(apPass);
 
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.setCursor(4, 58); tft.print("IP:");
   tft.setTextColor(COL_HILIGHT, COL_BG);
-  tft.setCursor(4, 70); tft.print(apIP);
+  tft.setCursor(40, 58); tft.print(apIP);
 
   tft.setTextColor(COL_DIM, COL_BG);
-  tft.setCursor(4, 90);  tft.print("Connect phone/PC to");
-  tft.setCursor(4, 102); tft.print("the SSID above, then");
-  tft.setCursor(4, 114); tft.print("open any web page.");
+  tft.setCursor(4, 80);  tft.print("Join this Wi-Fi, then");
+  tft.setCursor(4, 92);  tft.print("open any web page and");
+  tft.setCursor(4, 104); tft.print("unlock with your PIN.");
 }
 
 void drawWebPortalInfo() {
@@ -1401,7 +1537,18 @@ void setupWebPortalRoutes() {
        size_t index, size_t total) {
       if (index != 0) return;
 
-      DynamicJsonDocument body(256);
+      // Brute-force lockout: after MAX_PIN_ATTEMPTS wrong PINs, refuse all
+      // attempts for LOCKOUT_DURATION_MS regardless of correctness.
+      if (webPinAttempts >= MAX_PIN_ATTEMPTS) {
+        unsigned long elapsed = millis() - webLockoutStart;
+        if (elapsed < LOCKOUT_DURATION_MS) {
+          req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts — locked out\"}");
+          return;
+        }
+        webPinAttempts = 0;   // lockout window expired
+      }
+
+      JsonDocument body;
       if (deserializeJson(body, (char*)data, len)) {
         req->send(400, "application/json", "{\"ok\":false,\"error\":\"Bad JSON\"}");
         return;
@@ -1409,14 +1556,18 @@ void setupWebPortalRoutes() {
 
       const char* pin = body["pin"] | "";
       if (strlen(pin) != PIN_LENGTH) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"PIN must be 6 digits\"}");
+        req->send(400, "application/json", "{\"ok\":false,\"error\":\"PIN must be 6 characters\"}");
         return;
       }
 
       if (!verifyPin(pin)) {
+        webPinAttempts++;
+        if (webPinAttempts >= MAX_PIN_ATTEMPTS) webLockoutStart = millis();
         req->send(403, "application/json", "{\"ok\":false,\"error\":\"Wrong PIN\"}");
         return;
       }
+
+      webPinAttempts = 0;   // success resets the counter
 
       // PIN verified — populate sessionPin and decrypt vault
       strlcpy(sessionPin, pin, sizeof(sessionPin));
@@ -1425,7 +1576,7 @@ void setupWebPortalRoutes() {
       if (!vaultOk && LittleFS.exists(VAULT_FILE_PATH)) {
         // Vault file exists but can't decrypt — corrupted by old blank-key bug.
         // Delete the bad file and start fresh with an empty vault.
-        Serial.println(F("[WP]   Corrupt vault.enc detected — deleting and starting fresh"));
+        Serial.println(F("[WP]   Corrupt vault.dat detected — deleting and starting fresh"));
         LittleFS.remove(VAULT_FILE_PATH);
         vaultCount = 0;
       }
@@ -1442,46 +1593,51 @@ void setupWebPortalRoutes() {
   webServer.on("/api/vault", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!requireUnlock(req)) return;
 
-    AsyncWebServerResponse *response = req->beginChunkedResponse("application/json", [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-      static int currentIdx = 0;
-      static int phase = 0; // 0=header, 1=entries, 2=footer
+    // Per-request iteration state. Function-local statics would corrupt
+    // concurrent requests; _tempObject is auto-freed when the request is
+    // destroyed (including on client abort), so there is no leak.
+    struct VaultIter { int idx; int phase; };
+    req->_tempObject = calloc(1, sizeof(VaultIter));
+    if (!req->_tempObject) {
+      req->send(500, "application/json", "{\"ok\":false,\"error\":\"Out of memory\"}");
+      return;
+    }
 
-      if (index == 0) {
-        currentIdx = 0;
-        phase = 0;
-      }
+    AsyncWebServerResponse *response = req->beginChunkedResponse("application/json", [req](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      VaultIter* it = (VaultIter*)req->_tempObject;
+      if (!it) return 0;
 
-      if (phase == 0) {
-        phase = 1;
+      if (it->phase == 0) {
+        it->phase = 1;
         return snprintf((char*)buffer, maxLen, "{\"entries\":[");
       }
-      
-      if (phase == 1) {
-        if (currentIdx < vaultCount) {
+
+      if (it->phase == 1) {
+        if (it->idx < vaultCount) {
           Credential cred;
-          if (decryptEntry(currentIdx, sessionPin, &cred)) {
-            DynamicJsonDocument doc(256);
+          if (decryptEntry(it->idx, sessionPin, &cred)) {
+            JsonDocument doc;
             doc["n"] = cred.name;
             doc["u"] = cred.user;
             doc["p"] = ""; // Never send password
             String json;
             serializeJson(doc, json);
             memset(&cred, 0, sizeof(Credential)); // Wipe RAM
-            
-            size_t len = snprintf((char*)buffer, maxLen, "%s%s", (currentIdx > 0) ? "," : "", json.c_str());
-            currentIdx++;
+
+            size_t len = snprintf((char*)buffer, maxLen, "%s%s", (it->idx > 0) ? "," : "", json.c_str());
+            it->idx++;
             return len;
           } else {
-            currentIdx++;
+            it->idx++;
             return snprintf((char*)buffer, maxLen, " ");
           }
         } else {
-          phase = 2;
+          it->phase = 2;
         }
       }
 
-      if (phase == 2) {
-        phase = 3;
+      if (it->phase == 2) {
+        it->phase = 3;
         return snprintf((char*)buffer, maxLen, "]}");
       }
 
@@ -1500,7 +1656,7 @@ void setupWebPortalRoutes() {
       if (!requireUnlock(req)) return;
       if (index != 0) return;
 
-      DynamicJsonDocument body(1024);
+      JsonDocument body;
       DeserializationError err = deserializeJson(body, (char*)data, len);
       if (err) {
         req->send(400, "application/json", "{\"ok\":false,\"error\":\"Bad JSON\"}");
@@ -1517,7 +1673,7 @@ void setupWebPortalRoutes() {
       }
 
       bool ok = false;
-      if (body.containsKey("id")) {
+      if (body["id"].is<int>()) {
         int id = body["id"].as<int>();
         ok = updateCredential(id, n, u, (strlen(p) > 0 ? p : nullptr), sessionPin);
       } else {
@@ -1560,6 +1716,7 @@ void setupWebPortalRoutes() {
   //   can read it and send the accurate response.
   static uint8_t* importBuf = nullptr;
   static size_t   importLen = 0;
+  static bool     importOverflow = false;
 
   webServer.on(
     "/api/import", HTTP_POST,
@@ -1576,7 +1733,7 @@ void setupWebPortalRoutes() {
         req->_tempObject = nullptr;
       }
       if (imported < 0) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"Import failed\"}");
+        req->send(400, "application/json", "{\"ok\":false,\"error\":\"Import failed or file too large (max 32 KB)\"}");
         return;
       }
       String resp = String("{\"ok\":true,\"count\":") + imported + "}";
@@ -1590,6 +1747,7 @@ void setupWebPortalRoutes() {
       if (index == 0) {
         importBuf = (uint8_t*)malloc(32768);
         importLen = 0;
+        importOverflow = false;
         if (!importBuf) {
           Serial.println(F("[IMP]  Malloc failed for import buffer"));
           return;
@@ -1597,25 +1755,35 @@ void setupWebPortalRoutes() {
         Serial.printf("[IMP]  Upload started: %s\n", filename.c_str());
       }
 
-      if (importBuf && (importLen + len < 32767)) {
-        memcpy(importBuf + importLen, data, len);
-        importLen += len;
+      if (importBuf) {
+        if (importLen + len < 32767) {
+          memcpy(importBuf + importLen, data, len);
+          importLen += len;
+        } else {
+          importOverflow = true;   // file exceeds buffer — reject, don't silently truncate
+        }
       }
 
       if (isFinal && importBuf) {
-        importBuf[importLen] = '\0';
-
-        int countBefore = vaultCount;
-        String fn = filename;
-        fn.toLowerCase();
-        if (fn.endsWith(".xml")) {
-          importKeePassXML((const char*)importBuf, importLen, sessionPin);
+        int imported;
+        if (importOverflow) {
+          Serial.println(F("[IMP]  File exceeds 32 KB buffer — import aborted"));
+          imported = -1;
         } else {
-          importCSV((const char*)importBuf, importLen, sessionPin);
-        }
+          importBuf[importLen] = '\0';
 
-        int imported = vaultCount - countBefore;
-        Serial.printf("[IMP]  Parsed %d new entries (total %d)\n", imported, vaultCount);
+          int countBefore = vaultCount;
+          String fn = filename;
+          fn.toLowerCase();
+          if (fn.endsWith(".xml")) {
+            importKeePassXML((const char*)importBuf, importLen, sessionPin);
+          } else {
+            importCSV((const char*)importBuf, importLen, sessionPin);
+          }
+
+          imported = vaultCount - countBefore;
+          Serial.printf("[IMP]  Parsed %d new entries (total %d)\n", imported, vaultCount);
+        }
 
         // Store count for the request completion handler
         req->_tempObject = malloc(sizeof(int));
@@ -1649,7 +1817,7 @@ void setupWebPortalRoutes() {
       if (!requireUnlock(req)) return;
       if (index != 0) return;
 
-      DynamicJsonDocument body(256);
+      JsonDocument body;
       if (deserializeJson(body, (char*)data, len)) {
         req->send(400, "application/json", "{\"ok\":false,\"error\":\"Bad JSON\"}");
         return;
@@ -1659,7 +1827,7 @@ void setupWebPortalRoutes() {
       const char* newPin = body["new"] | "";
 
       if (strlen(oldPin) != PIN_LENGTH || strlen(newPin) != PIN_LENGTH) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"PIN must be 6 digits\"}");
+        req->send(400, "application/json", "{\"ok\":false,\"error\":\"PIN must be 6 characters\"}");
         return;
       }
 
@@ -1786,5 +1954,5 @@ void loopWebPortal() {
 }
 
 // =============================================================================
-// END OF FiskeyPass.ino  —  v4.0.0 complete
+// END OF FiskeyPass.ino  —  v4.0.1 complete
 // =============================================================================

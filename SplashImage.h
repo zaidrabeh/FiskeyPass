@@ -1,5 +1,5 @@
 // =============================================================================
-// SplashImage.h — FiskeyPass v2.5.1 Splash Screen Image
+// SplashImage.h — FiskeyPass v4.0.1 Splash Screen Image
 // =============================================================================
 // Uses whoami.h (already converted to byte array).
 // The firmware checks FISKEYPASS_HAS_SPLASH: bitmap if present, text fallback otherwise.

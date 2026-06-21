@@ -14,7 +14,7 @@ physically printed on the PCB):
 | Row | Pins (top → bottom) | Notes |
 |-----|---------------------|-------|
 | **Left side** (soldered header) | `LED` `SCK` `SDA` `AO` `RESET` `CS` `GND` `VCC` | TFT display interface |
-| **Right side** (bare holes) | ~~`SD_CS` `SD_MOSI` `SD_MISO` `SD_SCK`~~ | **Not used in v2.5.1 — leave unconnected** |
+| **Right side** (bare holes) | ~~`SD_CS` `SD_MOSI` `SD_MISO` `SD_SCK`~~ | **Not used — leave unconnected (SD card removed in v2.0+)** |
 
 ---
 
@@ -58,7 +58,7 @@ needed**. Wire each button between the GPIO pin and **GND**.
 > right, RETURN left.
 >
 > **Web Portal:** Select **Web Portal** from the Main Menu. The device writes a flag and
-> reboots into AP mode (`FiskeyPass-Setup`, password: `FiskeyAdmin123`). The PIN unlock
+> reboots into AP mode (`FiskeyPass-Setup`; the per-device WPA2 password is shown on the TFT). The PIN unlock
 > modal in the browser handles vault authentication — no separate portal credentials needed.
 
 ---
@@ -142,8 +142,8 @@ filesystem. No external SD card is needed or used.
 
 | File | Purpose |
 |------|---------|
-| `/config.json` | PIN hash (SHA-256), display timeout preference |
-| `/vault.enc` | AES-256-GCM encrypted credential store |
+| `/config.json` | PIN hash (salted PBKDF2-SHA256), display timeout preference |
+| `/vault.dat` | AES-256-GCM encrypted credential store (188-byte blocks) |
 
 Both files are created automatically at runtime on first boot. You do **not**
 need to pre-flash any files.
@@ -180,7 +180,7 @@ converted splash image) before first boot.
 
 ## Key Wiring Notes
 
-1. **No SD card** — The right-side SD holes on your module are unused in v2.5.1.
+1. **No SD card** — The right-side SD holes on your module are unused (SD support was removed in v2.0).
    Leave them unconnected. The SD library is not included in the firmware.
 
 2. **No level shifting required** — The ESP32 runs at 3.3 V logic. The ST7735

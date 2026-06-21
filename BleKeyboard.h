@@ -1,5 +1,5 @@
 // =============================================================================
-// BleKeyboard.h — FiskeyPass v2.5.1 NimBLE HID Keyboard Wrapper
+// BleKeyboard.h — FiskeyPass v4.0.1 NimBLE HID Keyboard Wrapper
 // =============================================================================
 //
 // Provides BLE HID keyboard functionality using NimBLE-Arduino by h2zero.
@@ -202,6 +202,12 @@ private:
   NimBLECharacteristic* _inputReport  = nullptr;
   bool                  _connected    = false;
   bool                  _initialized  = false;
+  NimBLEConnInfo        _pairConn;                 // conn awaiting passkey entry
+
+public:
+  volatile bool         pairPinRequested = false;  // set by onPassKeyEntry
+
+private:
 
   // Connection callbacks
   class ServerCallbacks : public NimBLEServerCallbacks {
@@ -219,8 +225,18 @@ private:
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
       parent->_connected = false;
       connectedBleMac[0] = '\0';
+      parent->pairPinRequested = false;   // abort any pending passkey entry
       Serial.println(F("[BLE]  Client disconnected"));
       NimBLEDevice::startAdvertising();
+    }
+
+    // Host is displaying a random passkey; the user must type it on the device.
+    // We flag the request and stash the connection so the UI loop can collect
+    // the digits and inject them via blePairSubmit().
+    void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
+      parent->_pairConn = connInfo;
+      parent->pairPinRequested = true;
+      Serial.println(F("[BLE]  Passkey entry requested — type code shown on host"));
     }
   };
 
@@ -231,15 +247,20 @@ public:
 
     NimBLEDevice::init(BLE_DEVICE_NAME);
     NimBLEDevice::setSecurityAuth(true, true, true);  // bonding, MITM, SC
-    // Removed setSecurityPasskey to allow "Just Works" pairing without phone forcing a typed PIN
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    // KeyboardOnly: the host (phone/PC) displays a fresh random passkey on each
+    // pairing attempt and the user types it on the FiskeyPass. This replaces the
+    // insecure "Just Works" model where any device could bond without approval.
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY);
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
     _server = NimBLEDevice::createServer();
+    if (!_server) { Serial.println(F("[BLE]  createServer failed (low heap)")); return false; }
     _server->setCallbacks(new ServerCallbacks(this));
 
     _hid = new NimBLEHIDDevice(_server);
+    if (!_hid) { Serial.println(F("[BLE]  HID alloc failed (low heap)")); return false; }
     _inputReport = _hid->getInputReport(1);           // NimBLE 2.x API
+    if (!_inputReport) { Serial.println(F("[BLE]  input report alloc failed")); return false; }
 
     _hid->setManufacturer("FiskeyPass");              // NimBLE 2.x API
     _hid->setPnp(0x02, 0xE502, 0xA111, 0x0210);       // NimBLE 2.x API
@@ -279,6 +300,19 @@ public:
 
   bool bleIsInitialized() {
     return _initialized;
+  }
+
+  // Inject the 6-digit passkey the user typed on the device into the SMP
+  // pairing procedure. A wrong code makes the host reject the bond.
+  void blePairSubmit(uint32_t passkey) {
+    pairPinRequested = false;
+    NimBLEDevice::injectPassKey(_pairConn, passkey);
+  }
+
+  // Abort pairing (user cancelled) by dropping the connection.
+  void blePairCancel() {
+    pairPinRequested = false;
+    if (_server) _server->disconnect(_pairConn.getConnHandle());
   }
 
   // Send a single keystroke

@@ -1,5 +1,5 @@
 // =============================================================================
-// VaultManager.h — FiskeyPass v4.0.0 Encrypted Vault & Config Management
+// VaultManager.h — FiskeyPass v4.0.1 Encrypted Vault & Config Management
 // =============================================================================
 //
 // Responsibilities:
@@ -127,7 +127,7 @@ static bool loadConfig() {
     return false;
   }
 
-  DynamicJsonDocument doc(512);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, f);
   f.close();
 
@@ -152,7 +152,7 @@ static bool loadConfig() {
 }
 
 static bool saveConfig() {
-  DynamicJsonDocument doc(512);
+  JsonDocument doc;
   doc["pinHash"] = deviceConfig.pinHash;
   doc["displayTimeout"] = deviceConfig.displayTimeoutEnabled;
   doc["portalUser"] = deviceConfig.portalUser;
@@ -175,12 +175,12 @@ static bool saveConfig() {
 
 static bool verifyPin(const char* pin) {
   char hash[65];
-  if (!hashPinSHA256(pin, hash, sizeof(hash))) return false;
+  if (!hashPinVerifier(pin, hash, sizeof(hash))) return false;
   return (strcmp(hash, deviceConfig.pinHash) == 0);
 }
 
 static bool setNewPin(const char* pin) {
-  if (!hashPinSHA256(pin, deviceConfig.pinHash, sizeof(deviceConfig.pinHash))) {
+  if (!hashPinVerifier(pin, deviceConfig.pinHash, sizeof(deviceConfig.pinHash))) {
     return false;
   }
   deviceConfig.firstBoot = false;
@@ -209,7 +209,8 @@ static bool decryptEntry(int index, const char* pin, Credential* outCred) {
   if (!deriveKey(pin, key, AES_KEY_SIZE)) return false;
 
   size_t ptLen = 0;
-  uint8_t* plaintext = decryptData(key, buf, BLOCK_SIZE, &ptLen);
+  uint8_t* plaintext = decryptData(key, buf, BLOCK_SIZE, &ptLen,
+                                   (const uint8_t*)&vaultIndex[index].fileOffset, sizeof(uint32_t));
   memset(key, 0, sizeof(key));
 
   if (plaintext && ptLen == sizeof(Credential)) {
@@ -228,22 +229,19 @@ static bool decryptEntry(int index, const char* pin, Credential* outCred) {
 static bool appendCredentialBlock(const Credential* cred, const char* pin) {
   if (vaultCount >= MAX_CREDENTIAL_ITEMS) return false;
 
+  fs::File f = LittleFS.open(VAULT_FILE_PATH, "a");   // append mode
+  if (!f) return false;
+  uint32_t offset = f.size();   // AAD must be known before we encrypt
+
   uint8_t key[AES_KEY_SIZE];
-  if (!deriveKey(pin, key, AES_KEY_SIZE)) return false;
+  if (!deriveKey(pin, key, AES_KEY_SIZE)) { f.close(); return false; }
 
   size_t encLen = 0;
-  uint8_t* encrypted = encryptData(key, (const uint8_t*)cred, sizeof(Credential), &encLen);
+  uint8_t* encrypted = encryptData(key, (const uint8_t*)cred, sizeof(Credential), &encLen,
+                                   (const uint8_t*)&offset, sizeof(offset));
   memset(key, 0, sizeof(key));
+  if (!encrypted) { f.close(); return false; }
 
-  if (!encrypted) return false;
-
-  fs::File f = LittleFS.open(VAULT_FILE_PATH, "a");   // append mode
-  if (!f) {
-    free(encrypted);
-    return false;
-  }
-
-  uint32_t offset = f.size();
   size_t written = f.write(encrypted, encLen);
   f.close();
   free(encrypted);
@@ -289,7 +287,8 @@ static bool loadVault(const char* pin) {
     if (readLen != BLOCK_SIZE) break;   // partial block = EOF or corruption
 
     size_t ptLen = 0;
-    uint8_t* plaintext = decryptData(key, buf, BLOCK_SIZE, &ptLen);
+    uint8_t* plaintext = decryptData(key, buf, BLOCK_SIZE, &ptLen,
+                                     (const uint8_t*)&offset, sizeof(offset));
     if (plaintext && ptLen == sizeof(Credential)) {
       Credential* cred = (Credential*)plaintext;
       strlcpy(vaultIndex[vaultCount].name, cred->name, CREDENTIAL_NAME_LEN);
@@ -326,10 +325,11 @@ static bool saveVault(const char* newPin) {
   for (int i = 0; i < vaultCount; i++) {
     if (!decryptEntry(i, sessionPin, &tempCred)) { success = false; break; }
 
+    uint32_t newOffset = newF.size();
     size_t encLen = 0;
-    uint8_t* encrypted = encryptData(newKey, (const uint8_t*)&tempCred, sizeof(Credential), &encLen);
+    uint8_t* encrypted = encryptData(newKey, (const uint8_t*)&tempCred, sizeof(Credential), &encLen,
+                                     (const uint8_t*)&newOffset, sizeof(newOffset));
     if (encrypted) {
-      uint32_t newOffset = newF.size();
       newF.write(encrypted, encLen);
       vaultIndex[i].fileOffset = newOffset;
       free(encrypted);
@@ -390,10 +390,11 @@ static bool updateCredential(int index, const char* name, const char* user, cons
       strlcpy(vaultIndex[i].name, tempCred.name, CREDENTIAL_NAME_LEN);
     }
 
+    uint32_t newOffset = newF.size();
     size_t encLen = 0;
-    uint8_t* encrypted = encryptData(key, (const uint8_t*)&tempCred, sizeof(Credential), &encLen);
+    uint8_t* encrypted = encryptData(key, (const uint8_t*)&tempCred, sizeof(Credential), &encLen,
+                                     (const uint8_t*)&newOffset, sizeof(newOffset));
     if (encrypted) {
-      uint32_t newOffset = newF.size();
       newF.write(encrypted, encLen);
       vaultIndex[i].fileOffset = newOffset;
       free(encrypted);
@@ -437,10 +438,11 @@ static bool deleteCredential(int index, const char* pin) {
 
     if (!decryptEntry(i, pin, &tempCred)) { success = false; break; }
 
+    uint32_t newOffset = newF.size();
     size_t encLen = 0;
-    uint8_t* encrypted = encryptData(key, (const uint8_t*)&tempCred, sizeof(Credential), &encLen);
+    uint8_t* encrypted = encryptData(key, (const uint8_t*)&tempCred, sizeof(Credential), &encLen,
+                                     (const uint8_t*)&newOffset, sizeof(newOffset));
     if (encrypted) {
-      uint32_t newOffset = newF.size();
       newF.write(encrypted, encLen);
       strlcpy(vaultIndex[newCount].name, tempCred.name, CREDENTIAL_NAME_LEN);
       vaultIndex[newCount].fileOffset = newOffset;
@@ -674,6 +676,7 @@ static int importKeePassXML(const char* xmlData, size_t dataLen, const char* pin
 static void factoryReset() {
   LittleFS.remove(VAULT_FILE_PATH);
   LittleFS.remove(CONFIG_FILE_PATH);
+  wipeKeyCache();
   vaultCount = 0;
   memset(vaultIndex, 0, sizeof(vaultIndex));
   memset(&deviceConfig, 0, sizeof(deviceConfig));

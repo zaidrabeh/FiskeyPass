@@ -11,9 +11,7 @@
 | **Main file** | `FiskeyPass.ino` (must match folder name for Arduino IDE) |
 | **Hardware** | ESP32 DevKit V1 + 1.8" ST7735 TFT (128×160) |
 | **Purpose** | Encrypted hardware password vault with BLE HID keyboard |
-| **Version** | v4.0.0 |
-| **Purpose** | Encrypted hardware password vault with BLE HID keyboard |
-| **Version** | v4 |
+| **Version** | v4.0.1 |
 
 ---
 
@@ -41,7 +39,7 @@
 - **Core 3.x Migration**: Updated `mbedtls` calls to 3.x API, resolved `LittleFS` namespace collisions
 - **Library Patches**: Patched `ESPAsyncWebServer` and `AsyncTCP` for LwIP/mbedtls compatibility
 - **Reboot Flag Pattern**: Replaced "hold button at boot" AP trigger with a Main Menu option that writes `/portal.flag` and restarts. Avoids radio coexistence crashes (BLE and WiFi never run in the same session)
-- **Security**: WPA2-PSK enforced on AP, BLE pairing passkey `123456`
+- **Security**: WPA2-PSK enforced on AP, BLE pairing with a static passkey `123456` (replaced by Passkey Entry in v4.0.1)
 
 ### Phase 5 — v2.2 (Security & Logic Fixes)
 - **AZERTY Layout**: Rewrote `asciiToHID` to support French AZERTY layouts
@@ -56,10 +54,21 @@
 ### Phase 7 — v4 (Architecture Hardening — CURRENT)
 - **Blank Key Bug Fixed**: `sessionPin` was never populated in the portal path, so `saveVault("")` encrypted with a blank-derived key, making the vault unreadable on reboot
 - **Purged ECDH complexity**: Removed `SecureLayerManager`, `TrafficObfuscationManager`, `secureFetch()`, `authenticatedClients` set, and all `X-Client-ID` auth
-- **PIN unlock modal**: Replaced the old login-credential system with a mandatory 4-digit device PIN entry in the browser (`POST /api/vault-unlock`)
+- **PIN unlock modal**: Replaced the old login-credential system with a mandatory 6-digit device PIN entry in the browser (`POST /api/vault-unlock`)
 - **Import timing fixed**: ESPAsyncWebServer multipart fires the request handler before the upload handler; fixed via `req->_tempObject` to pass count from upload handler to completion handler
 - **AP Boot Gatekeeper fixed**: Portal now boots whenever `/portal.flag` exists, regardless of RTC PIN state (hard reset path is safe because web UI handles auth)
-- **Corrupt vault recovery**: If correct PIN passes `verifyPin()` but `loadVault()` fails (old blank-key corruption), the bad `vault.enc` is deleted and the vault starts fresh rather than blocking permanently
+- **Corrupt vault recovery**: If correct PIN passes `verifyPin()` but `loadVault()` fails (old blank-key corruption), the bad `vault.dat` is deleted and the vault starts fresh rather than blocking permanently
+
+### Phase 8 — v4.0.1 (Security Hardening — CURRENT)
+- **Salted PIN verifier**: `config.json` PIN hash moved from unsalted single-round SHA-256 to salted PBKDF2-SHA256 (MAC salt + domain-separation byte), defeating instant flash-dump cracking
+- **Alphanumeric PIN**: unlock/create PIN now uses a configurable charset (default digits + lowercase, 36 chars) via a charset index; UP/DOWN cycle (hold to fast-repeat) with a "Char X of 6" indicator. BLE pairing stays numeric
+- **BLE Passkey Entry**: replaced insecure "Just Works" (`BLE_HS_IO_NO_INPUT_OUTPUT`) with `BLE_HS_IO_KEYBOARD_ONLY` — host shows a random passkey typed on the TFT (`onPassKeyEntry` → `injectPassKey`, new `STATE_BLE_PAIR`)
+- **Web brute-force lockout**: `/api/vault-unlock` now enforces `MAX_PIN_ATTEMPTS`/`LOCKOUT_DURATION_MS`
+- **Per-device AP password**: WPA2 password derived from the chip MAC and shown on the TFT (no shared default)
+- **GCM block-position binding**: each block authenticates its file offset as AAD (no silent reordering)
+- **Session key cache**: PBKDF2 vault key memoised per PIN (scrubbed on factory reset), removing the per-block derivation storm
+- **Robustness**: import-overflow rejection, per-request `GET /api/vault` state, BLE init heap guards, removed debug credential, migrated to ArduinoJson v7 (`JsonDocument`)
+- ⚠️ **Breaking**: PIN-hash and vault-AAD formats changed — upgrading from v4.0.0 requires a one-time factory reset (erase flash)
 
 ---
 
@@ -123,27 +132,31 @@ BOOT
                                               │                └→ Type Password (BLE HID)
                                               ├→ WEB PORTAL (write flag → reboot)
                                               └→ SETTINGS
+
+  (BLE_PAIR: any unlocked state is interrupted by STATE_BLE_PAIR when a host
+   begins pairing — user types the host's passkey, then returns to MAIN_MENU)
 ```
 
 ### 5.2 Security Architecture
 
 **PIN Authentication:**
-- 6-digit PIN stored as SHA-256 hash in `/config.json`
-- 5 wrong attempts → 60-second lockout
+- 6-character alphanumeric PIN stored as salted PBKDF2-SHA256 hash in `/config.json`
+- 5 wrong attempts → 60-second lockout (enforced both on-device and on `POST /api/vault-unlock`)
 - First boot → force user to set a new PIN
 
 **Encryption (mbedtls 3.x):**
 - **Algorithm**: AES-256-GCM
-- **Key Derivation**: PBKDF2-SHA256(PIN + ESP32 MAC salt, 10,000 iterations)
-- **Storage**: `/vault.dat` on LittleFS (Block streaming)
+- **Key Derivation**: PBKDF2-SHA256(PIN + ESP32 MAC salt, 10,000 iterations), memoised per session (scrubbed on factory reset)
+- **Integrity**: each block authenticates its file offset as GCM AAD (blocks cannot be reordered/swapped)
+- **Storage**: `/vault.dat` on LittleFS (188-byte block streaming: `[12B IV][160B CT][16B tag]`)
 
 ### 5.3 Web Portal (v4)
-- **Network Security**: WPA2-PSK (`FiskeyPass-Setup` / `FiskeyAdmin123`)
-- **Vault Security**: Mandatory 6-digit PIN unlock modal on every session (`POST /api/vault-unlock`)
+- **Network Security**: WPA2-PSK, per-device password derived from the chip MAC and displayed on the TFT (`FiskeyPass-Setup` / `FP########`)
+- **Vault Security**: Mandatory 6-character PIN unlock modal on every session (`POST /api/vault-unlock`)
 - **Auth gate**: `vaultUnlocked` boolean (static global in `FiskeyPass.ino`) — all API routes call `requireUnlock()` before any operation
 - **Passwords**: Never returned by the API — `GET /api/vault` returns names and usernames only
 - **Import**: CSV and KeePass XML; `req->_tempObject` bridges upload handler count to completion handler
-- **Corrupt vault recovery**: Bad `vault.enc` detected → deleted → fresh empty vault unlocked
+- **Corrupt vault recovery**: Bad `vault.dat` detected → deleted → fresh empty vault unlocked
 - **Radio isolation**: Portal session never initializes BLE; normal session never initializes WiFi
 
 ### 5.4 API Routes
@@ -161,7 +174,7 @@ BOOT
 
 ### 5.5 BLE HID Keyboard
 - **Library**: NimBLE-Arduino 2.x
-- **Security**: Passkey `123456` (IO Cap: Display Only)
+- **Security**: Passkey Entry pairing (IO Cap: Keyboard Only) — host displays a random 6-digit passkey, user types it on the TFT to authorise the bond (`onPassKeyEntry` → `injectPassKey`)
 - **Initialization**: Deferred until after successful PIN entry on TFT
 - **Radio**: Disabled entirely during portal sessions
 
@@ -183,7 +196,7 @@ BOOT
 
 - **Storage**: LittleFS (internal flash) ONLY — no SD card
 - **AP Access**: WPA2-PSK secured
-- **Portal Auth**: Device 6-digit PIN via web modal, not separate credentials
+- **Portal Auth**: Device 6-character PIN via web modal, not separate credentials
 - **Reboot Flag**: Used to avoid simultaneous BLE/WiFi radio conflicts
 - **No ECDH / HTTPS**: Plain HTTP/JSON — air-gapped LAN use only
 - **mbedtls**: Used for AES-256-GCM and PBKDF2 only (no ECDH)
@@ -197,6 +210,6 @@ BOOT
 3. **GPIO 33**: Input-only on ESP32 — may need external pull-up if always reads LOW.
 4. **Namespace**: `LittleFS` file operations require `fs::` prefix (e.g., `fs::File`).
 5. **NimBLE deinit**: `NimBLEDevice::deinit(true)` panics in ESP-IDF v5 — use Reboot Flag pattern instead.
-6. **ArduinoJson**: Use sufficient document size for vault parsing (~4 KB for 24 entries).
+6. **ArduinoJson v7**: Use `JsonDocument` (elastic, no fixed capacity) — `DynamicJsonDocument`/`StaticJsonDocument` and `containsKey()` are deprecated.
 7. **PROGMEM for web HTML**: Dashboard HTML must be in PROGMEM to avoid consuming heap RAM.
 8. **ESPAsyncWebServer multipart order**: Request completion handler fires *before* upload handler in some versions — use `req->_tempObject` to pass state from upload to completion handler.
